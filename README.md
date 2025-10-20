@@ -14,6 +14,6 @@
 - `example.env` — пример переменных окружения для API-ключей и подключения к БД.
 
 ## Быстрый старт
-- Создайте виртуальное окружение и установите зависимости (`pip install streamlit pandas requests clickhouse-driver python-dotenv`).
+- Создайте виртуальное окружение и установите зависимости: `pip install -r requirements.txt`.
 - Скопируйте `example.env` в `.env`, заполните токен ФГИС и параметры ClickHouse.
 - Запустите приложение командой `streamlit run main.py`.

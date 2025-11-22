@@ -7,6 +7,8 @@ from .parsing import parse_vri_payload
 from .queries import distinct_mit_numbers
 from .ui_helpers import ch_connect_from_sidebar, read_optional_dataframe
 from .utils import (
+    BatchMIT,
+    BatchVRI,
     collect_mit_batches,
     collect_vri_batches,
     h64,
@@ -27,6 +29,8 @@ __all__ = [
     "read_optional_dataframe",
     "collect_mit_batches",
     "collect_vri_batches",
+    "BatchMIT",
+    "BatchVRI",
     "distinct_mit_numbers",
     "h64",
     "parse_date_ddmmyyyy",

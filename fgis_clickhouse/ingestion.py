@@ -2,22 +2,29 @@
 
 from __future__ import annotations
 
-from typing import Dict, Iterable, List, Optional, Tuple
+from typing import Callable, Dict, Iterator, List, Optional, Tuple
 
 import streamlit as st
 
 from .clickhouse_io import CH
 from .fgis_api import FGISClient
 from .inserts import insert_mit_details, insert_mit_search, insert_vri_details, insert_vri_search
+from .utils import BatchMIT, BatchVRI
+
+PaginatedFetch = Callable[[int, int], Tuple[List[Dict[str, object]], int]]
+
+VRI_PROGRESS_STEPS = 800.0
+MIT_PROGRESS_STEPS = 500.0
+
 
 def paginate(
-    fetch,
+    fetch: PaginatedFetch,
     *,
     rows: int,
     start: int,
     all_pages: bool,
     max_pages: int,
-):
+) -> Iterator[Tuple[List[Dict[str, object]], int, int]]:
     """Generator that yields `(docs, total, page_idx)` triples for Solr-like pagination."""
     current_start = start
     page = 0
@@ -32,10 +39,30 @@ def paginate(
             break
 
 
+class ProgressReporter:
+    """Streamlit progress + log helper to keep UI code tidy."""
+
+    def __init__(self, budget: float):
+        self._budget = budget
+        self._completed = 0.0
+        self._log_box = st.empty()
+        self._progress = st.progress(0.0)
+
+    def log(self, message: str) -> None:
+        self._log_box.write(message)
+
+    def tick(self, weight: int = 1) -> None:
+        self._completed += weight
+        self._progress.progress(min(0.99, self._completed / self._budget))
+
+    def finish(self) -> None:
+        self._progress.progress(1.0)
+
+
 def ingest_vri(
     ch: CH,
     client: FGISClient,
-    batches: List[Tuple[Optional[str], Optional[str], Optional[str]]],
+    batches: List[BatchVRI],
     *,
     year: int,
     verifier: str,
@@ -55,15 +82,7 @@ def ingest_vri(
     total_parsed = 0
     total_mieta = 0
     total_mis = 0
-
-    log_box = st.empty()
-    progress = st.progress(0.0)
-    completed_steps = 0
-
-    def tick(step_weight: int = 1) -> None:
-        nonlocal completed_steps
-        completed_steps += step_weight
-        progress.progress(min(0.99, completed_steps / 800.0))
+    progress = ProgressReporter(VRI_PROGRESS_STEPS)
 
     for batch_index, (mitnumber, serial, mititle) in enumerate(batches, start=1):
 
@@ -80,15 +99,11 @@ def ingest_vri(
                 start=start,
             )
 
-        for docs, num_found, page in paginate(
-            fetch_page,
-            rows=rows,
-            start=start,
-            all_pages=all_pages,
-            max_pages=max_pages,
-        ):
+        batch_label = f"[{batch_index}/{len(batches)}]"
+
+        for docs, num_found, page in paginate(fetch_page, rows=rows, start=start, all_pages=all_pages, max_pages=max_pages):
             if not docs:
-                log_box.write(f"[{batch_index}/{len(batches)}] страниц больше нет.")
+                progress.log(f"{batch_label} страниц больше нет.")
                 break
 
             docs_to_insert = docs
@@ -99,8 +114,8 @@ def ingest_vri(
                 docs_to_insert = [doc for doc in docs if doc.get("vri_id") and doc["vri_id"] not in existing]
             inserted = insert_vri_search(ch, docs_to_insert, run_id, tag)
             total_new_search += inserted
-            log_box.write(f"[{batch_index}/{len(batches)}] page {page}, получено {len(docs)}, новых {inserted} (из {num_found})")
-            tick()
+            progress.log(f"{batch_label} page {page}, получено {len(docs)}, новых {inserted} (из {num_found})")
+            progress.tick()
 
             vri_ids_all = [doc.get("vri_id") for doc in docs if doc.get("vri_id")]
             ids_to_fetch = vri_ids_all
@@ -118,20 +133,20 @@ def ingest_vri(
                     total_mieta += mieta
                     total_mis += mis
                     buffer.clear()
-                    log_box.write(f"  детали {idx}/{len(ids_to_fetch)} (+parsed {parsed}, mieta {mieta}, mis {mis})")
-                    tick()
+                    progress.log(f"  детали {idx}/{len(ids_to_fetch)} (+parsed {parsed}, mieta {mieta}, mis {mis})")
+                    progress.tick()
 
             if not all_pages:
                 break
 
-    progress.progress(1.0)
+    progress.finish()
     return total_new_search, total_parsed, total_mieta, total_mis
 
 
 def ingest_mit(
     ch: CH,
     client: FGISClient,
-    batches: List[Tuple[str, Optional[str], Optional[str]]],
+    batches: List[BatchMIT],
     *,
     rows: int,
     start: int,
@@ -146,15 +161,7 @@ def ingest_mit(
     """Drive MIT search ingestion with optional detail loading."""
     total_new_search = 0
     total_details = 0
-
-    log_box = st.empty()
-    progress = st.progress(0.0)
-    completed_steps = 0
-
-    def tick(step_weight: int = 1) -> None:
-        nonlocal completed_steps
-        completed_steps += step_weight
-        progress.progress(min(0.99, completed_steps / 500.0))
+    progress = ProgressReporter(MIT_PROGRESS_STEPS)
 
     for batch_index, (manufacturer, title, notation) in enumerate(batches, start=1):
 
@@ -167,15 +174,11 @@ def ingest_mit(
                 start=start,
             )
 
-        for docs, num_found, page in paginate(
-            fetch_page,
-            rows=rows,
-            start=start,
-            all_pages=all_pages,
-            max_pages=max_pages,
-        ):
+        batch_label = f"[{batch_index}/{len(batches)}]"
+
+        for docs, num_found, page in paginate(fetch_page, rows=rows, start=start, all_pages=all_pages, max_pages=max_pages):
             if not docs:
-                log_box.write(f"[{batch_index}/{len(batches)}] страниц больше нет.")
+                progress.log(f"{batch_label} страниц больше нет.")
                 break
 
             docs_to_insert = docs
@@ -186,8 +189,8 @@ def ingest_mit(
                 docs_to_insert = [doc for doc in docs if doc.get("mit_uuid") and doc["mit_uuid"] not in existing]
             inserted = insert_mit_search(ch, docs_to_insert, run_id, tag)
             total_new_search += inserted
-            log_box.write(f"[{batch_index}/{len(batches)}] page {page}, получено {len(docs)}, новых {inserted} (из {num_found})")
-            tick()
+            progress.log(f"{batch_label} page {page}, получено {len(docs)}, новых {inserted} (из {num_found})")
+            progress.tick()
 
             if auto_details:
                 mit_ids_all = [doc.get("mit_uuid") for doc in docs if doc.get("mit_uuid")]
@@ -204,11 +207,11 @@ def ingest_mit(
                         inserted_details = insert_mit_details(ch, buffer, run_id, tag)
                         total_details += inserted_details
                         buffer.clear()
-                        log_box.write(f"  детали {idx}/{len(ids_to_fetch)} (вставлено chunk)")
-                        tick()
+                        progress.log(f"  детали {idx}/{len(ids_to_fetch)} (вставлено chunk)")
+                        progress.tick()
 
             if not all_pages:
                 break
 
-    progress.progress(1.0)
+    progress.finish()
     return total_new_search, total_details

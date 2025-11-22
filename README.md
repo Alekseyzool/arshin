@@ -17,5 +17,15 @@ Streamlit-сервис, который забирает поверки и утв
 
 ## Инструкция по запуску
 1. Создайте виртуальное окружение и установите зависимости: `pip install -r requirements.txt`.
-2. Скопируйте `example.env` в `.env`, заполните токен ФГИС и параметры ClickHouse.
+2. Скопируйте `example.env` в `.env`, заполните параметры ClickHouse и proxy (если нужен).
 3. Запустите приложение командой `streamlit run main.py`.
+4. В боковой панели Streamlit укажите подключение к ClickHouse, RPS и при необходимости proxy, затем работайте во вкладках VRI/MIT.
+
+## Структура
+- `main.py` — Streamlit-UI, контролы для запуска выгрузок.
+- `fgis_clickhouse/fgis_api.py` — обращения к API ФГИС.
+- `fgis_clickhouse/http_client.py` — HTTP-клиент с ограничением RPS.
+- `fgis_clickhouse/ingestion.py` — загрузка, пагинация, прогресс.
+- `fgis_clickhouse/inserts.py` — превращение JSON в строки ClickHouse.
+- `fgis_clickhouse/utils.py` — утилиты, нормализация дат/серийников, сбор батчей.
+- `fgis_clickhouse/ui_helpers.py` — подключение к ClickHouse и чтение CSV/XLSX.

@@ -3,8 +3,12 @@
 from __future__ import annotations
 
 import warnings
-import streamlit as st
+from typing import Optional
 
+import streamlit as st
+from dotenv import load_dotenv
+
+from fgis_clickhouse.clickhouse_io import CH
 from fgis_clickhouse.fgis_api import FGISClient
 from fgis_clickhouse.http_client import MIN_RPS
 from fgis_clickhouse.ingestion import ingest_mit, ingest_vri
@@ -17,10 +21,11 @@ from fgis_clickhouse.utils import (
     try_parse_since,
 )
 
+load_dotenv()
 warnings.filterwarnings("ignore", message="urllib3 v2 only supports OpenSSL")
 
 
-def run_vri_tab(ch, client: FGISClient, tag: str) -> None:
+def run_vri_tab(ch: Optional[CH], client: FGISClient, tag: str) -> None:
     """Render the VRI ingestion tab."""
     st.subheader("Поиск поверок → ClickHouse (+ детали распарсены)")
     col1, col2, col3 = st.columns(3)
@@ -44,7 +49,8 @@ def run_vri_tab(ch, client: FGISClient, tag: str) -> None:
     st.caption("Пакетный поиск CSV/XLSX: колонки `mi_mitnumber`, `mi_number`, `mi_mititle` (любые из них)")
     df_vri = read_optional_dataframe(st.file_uploader("Загрузить CSV/XLSX для VRI", type=["csv", "xlsx"], key="file_vri"))
 
-    run_vri = st.button("▶ Запустить поиск и загрузку", key="btn_vri", disabled=("_ch" not in st.session_state))
+    is_connected = ch is not None
+    run_vri = st.button("▶ Запустить поиск и загрузку", key="btn_vri", disabled=not is_connected)
     if run_vri and ch is not None:
         run_id = f"vri-{ts_compact()}"
         since_iso = try_parse_since(since_txt)
@@ -76,9 +82,11 @@ def run_vri_tab(ch, client: FGISClient, tag: str) -> None:
             tag=tag,
         )
         st.success(f"Готово. Новых VRI={new_rows}, распарсено={parsed}, mieta={mieta}, mis={mis}, run_id={run_id}")
+    elif run_vri and not is_connected:
+        st.error("Сначала подключитесь к ClickHouse.")
 
 
-def run_mit_tab(ch, client: FGISClient, tag: str) -> None:
+def run_mit_tab(ch: Optional[CH], client: FGISClient, tag: str) -> None:
     """Render the MIT ingestion tab."""
     st.subheader("Поиск утверждений типа → ClickHouse (без изменений)")
     col1, col2, col3 = st.columns(3)
@@ -100,7 +108,8 @@ def run_mit_tab(ch, client: FGISClient, tag: str) -> None:
     st.caption("Пакетный поиск CSV/XLSX: колонки `manufacturer`, `title`, `notation`")
     df_mit = read_optional_dataframe(st.file_uploader("Загрузить CSV/XLSX для MIT", type=["csv", "xlsx"], key="file_mit"))
 
-    run_mit = st.button("▶ Запустить поиск по типам", key="btn_mit", disabled=("_ch" not in st.session_state))
+    is_connected = ch is not None
+    run_mit = st.button("▶ Запустить поиск по типам", key="btn_mit", disabled=not is_connected)
     if run_mit and ch is not None:
         batches = collect_mit_batches(manufacturer, title, notation, df_mit)
         if not batches:
@@ -122,6 +131,8 @@ def run_mit_tab(ch, client: FGISClient, tag: str) -> None:
                 tag=tag,
             )
             st.success(f"Готово. Новых MIT={new_rows}, деталей={details}, run_id={run_id}")
+    elif run_mit and not is_connected:
+        st.error("Сначала подключитесь к ClickHouse.")
 
     st.markdown("### Поверки по скачанным типам")
     st.caption("Берём все номера утверждений типа из ClickHouse и ищем по ним поверки (mi.mitnumber).")
@@ -137,7 +148,7 @@ def run_mit_tab(ch, client: FGISClient, tag: str) -> None:
     with col_c:
         skip_existing_details_bridge = st.checkbox("Пропустить детали, если уже есть", True, key="mit_vri_skip_details")
         st.markdown("&nbsp;", unsafe_allow_html=True)
-        load_vri_btn = st.button("▶ Получить поверки для всех номеров", key="btn_mit_vri", disabled=("_ch" not in st.session_state))
+        load_vri_btn = st.button("▶ Получить поверки для всех номеров", key="btn_mit_vri", disabled=not is_connected)
 
     if load_vri_btn and ch is not None:
         numbers = distinct_mit_numbers(ch, limit_numbers if limit_numbers > 0 else None)
@@ -167,6 +178,8 @@ def run_mit_tab(ch, client: FGISClient, tag: str) -> None:
             st.success(
                 f"Готово. Новых VRI={new_rows}, распарсено={parsed}, mieta={mieta}, mis={mis}, run_id={run_id}"
             )
+    elif load_vri_btn and not is_connected:
+        st.error("Сначала подключитесь к ClickHouse.")
 
 
 def main() -> None:

@@ -9,6 +9,9 @@ from typing import Any, Dict, Iterator, List, Optional, Sequence, Tuple
 
 import pandas as pd
 
+BatchVRI = Tuple[Optional[str], Optional[str], Optional[str]]
+BatchMIT = Tuple[str, Optional[str], Optional[str]]
+
 EPOCH_DT = dt.datetime(1970, 1, 1, 0, 0, 0)
 # ClickHouse DateTime (UInt32) upper bound: 2106-02-07 06:28:15
 MAX_CH_DATETIME = dt.datetime(2106, 2, 7, 6, 28, 15)
@@ -69,29 +72,29 @@ def parse_dt_value(raw: Any) -> dt.datetime:
     """Parse ClickHouse DateTime fields into naive datetime instances."""
     if not raw:
         return EPOCH_DT
+
     if isinstance(raw, dt.datetime):
-        result = raw.replace(tzinfo=None)
+        parsed = raw.replace(tzinfo=None)
     elif isinstance(raw, dt.date):
-        result = dt.datetime(raw.year, raw.month, raw.day)
+        parsed = dt.datetime(raw.year, raw.month, raw.day)
     else:
         clean = str(raw).strip().replace("Z", "").replace("T", " ")
+        parsed: Optional[dt.datetime] = None
         for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d"):
             try:
-                result = dt.datetime.strptime(clean, fmt)
+                parsed = dt.datetime.strptime(clean, fmt).replace(tzinfo=None)
                 break
             except ValueError:
-                result = None
-        else:
-            result = None
+                continue
 
-    if result is None:
+    if parsed is None:
         return EPOCH_DT
 
-    if result < EPOCH_DT:
+    if parsed < EPOCH_DT:
         return EPOCH_DT
-    if result > MAX_CH_DATETIME:
+    if parsed > MAX_CH_DATETIME:
         return MAX_CH_DATETIME
-    return result
+    return parsed
 
 
 def parse_date_ddmmyyyy(raw: Optional[str]) -> dt.date:
@@ -141,28 +144,41 @@ def collect_vri_batches(
     docnum: str,
     since_iso: Optional[str],
     df: Optional[pd.DataFrame],
-) -> List[Tuple[Optional[str], Optional[str], Optional[str]]]:
-    """Compose search batches from the form inputs and optional CSV/XLSX."""
-    batches: List[Tuple[Optional[str], Optional[str], Optional[str]]] = []
+) -> List[BatchVRI]:
+    """Compose search batches from the form inputs and optional CSV/XLSX (deduplicated)."""
+    batches: List[BatchVRI] = []
+    seen: set[BatchVRI] = set()
+
+    def _normalize(value: Any) -> Optional[str]:
+        if value is None:
+            return None
+        try:
+            if pd.isna(value):
+                return None
+        except Exception:
+            pass
+        text = str(value).strip()
+        return text or None
+
+    def _add(batch: BatchVRI) -> None:
+        if batch in seen:
+            return
+        seen.add(batch)
+        batches.append(batch)
+
     if any([year, verifier, mitnumber, serial, mititle, docnum, since_iso]):
-        batches.append(
-            (
-                (mitnumber or "").strip() or None,
-                (serial or "").strip() or None,
-                (mititle or "").strip() or None,
-            )
-        )
+        _add((_normalize(mitnumber), _normalize(serial), _normalize(mititle)))
     if df is not None:
         for _, row in df.iterrows():
-            batches.append(
+            _add(
                 (
-                    (str(row.get("mi_mitnumber")) if pd.notna(row.get("mi_mitnumber")) else "").strip() or None,
-                    (str(row.get("mi_number")) if pd.notna(row.get("mi_number")) else "").strip() or None,
-                    (str(row.get("mi_mititle")) if pd.notna(row.get("mi_mititle")) else "").strip() or None,
+                    _normalize(row.get("mi_mitnumber")),
+                    _normalize(row.get("mi_number")),
+                    _normalize(row.get("mi_mititle")),
                 )
             )
     if not batches:
-        batches.append((None, None, None))
+        _add((None, None, None))
     return batches
 
 
@@ -171,23 +187,37 @@ def collect_mit_batches(
     title: str,
     notation: str,
     df: Optional[pd.DataFrame],
-) -> List[Tuple[str, Optional[str], Optional[str]]]:
-    """Compose MIT search batches from manual input and uploaded file."""
-    batches: List[Tuple[str, Optional[str], Optional[str]]] = []
-    if manufacturer:
-        batches.append((manufacturer, title or None, notation or None))
+) -> List[BatchMIT]:
+    """Compose MIT search batches from manual input and uploaded file (deduplicated)."""
+    batches: List[BatchMIT] = []
+    seen: set[BatchMIT] = set()
+
+    def _normalize(value: Any) -> Optional[str]:
+        if value is None:
+            return None
+        try:
+            if pd.isna(value):
+                return None
+        except Exception:
+            pass
+        text = str(value).strip()
+        return text or None
+
+    def _add(batch: BatchMIT) -> None:
+        if batch in seen:
+            return
+        seen.add(batch)
+        batches.append(batch)
+
+    manual_batch = (_normalize(manufacturer), _normalize(title), _normalize(notation))
+    if manual_batch[0]:
+        _add(manual_batch)
     if df is not None:
         for _, row in df.iterrows():
-            man = (str(row.get("manufacturer")) if pd.notna(row.get("manufacturer")) else "").strip()
+            man = _normalize(row.get("manufacturer"))
             if not man:
                 continue
-            batches.append(
-                (
-                    man,
-                    (str(row.get("title")) if pd.notna(row.get("title")) else "").strip() or None,
-                    (str(row.get("notation")) if pd.notna(row.get("notation")) else "").strip() or None,
-                )
-            )
+            _add((man, _normalize(row.get("title")), _normalize(row.get("notation"))))
     return batches
 
 

@@ -27,13 +27,13 @@ warnings.filterwarnings("ignore", message="urllib3 v2 only supports OpenSSL")
 
 
 def _store_last_result(kind: str, docs) -> None:
-    """Persist last fetched docs in session for download."""
-    if not docs:
+    """Persist last fetched docs in session for download (empty allowed)."""
+    if docs is None:
         return
     st.session_state["last_result"] = {"kind": kind, "docs": list(docs)}
 
 
-def render_last_download() -> None:
+def render_last_download(key_suffix: str) -> None:
     """Render a download button for the last query result (any tab)."""
     payload = st.session_state.get("last_result")
     if not payload:
@@ -47,6 +47,7 @@ def render_last_download() -> None:
         data=csv,
         file_name=f"{kind}_last.csv",
         mime="text/csv",
+        key=f"download_last_{key_suffix}",
     )
 
 
@@ -231,10 +232,10 @@ def main() -> None:
     tab_vri, tab_mit = st.tabs(["🔎 Поверки (VRI)", "📚 Утверждения типов (MIT)"])
     with tab_vri:
         run_vri_tab(ch, client, tag)
-        render_last_download()
+        render_last_download("vri_tab")
     with tab_mit:
         run_mit_tab(ch, client, tag)
-        render_last_download()
+        render_last_download("mit_tab")
 
 
 if __name__ == "__main__":

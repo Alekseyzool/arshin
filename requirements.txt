@@ -3,3 +3,4 @@ requests
 pandas
 clickhouse-driver
 python-dotenv
+openpyxl

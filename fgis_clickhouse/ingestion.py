@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Callable, Dict, Iterator, List, Optional, Tuple
+from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple
 
 import streamlit as st
 
@@ -76,6 +76,7 @@ def ingest_vri(
     skip_existing_details: bool,
     run_id: str,
     tag: str,
+    collector: Optional[List[Dict[str, Any]]] = None,
 ) -> Tuple[int, int, int, int]:
     """Drive VRI search/detail ingestion and surface progress in Streamlit."""
     total_new_search = 0
@@ -105,6 +106,9 @@ def ingest_vri(
             if not docs:
                 progress.log(f"{batch_label} страниц больше нет.")
                 break
+
+            if collector is not None:
+                collector.extend(docs)
 
             docs_to_insert = docs
             if skip_existing_rows:
@@ -157,6 +161,7 @@ def ingest_mit(
     skip_existing_details: bool,
     run_id: str,
     tag: str,
+    collector: Optional[List[Dict[str, Any]]] = None,
 ) -> Tuple[int, int]:
     """Drive MIT search ingestion with optional detail loading."""
     total_new_search = 0
@@ -180,6 +185,9 @@ def ingest_mit(
             if not docs:
                 progress.log(f"{batch_label} страниц больше нет.")
                 break
+
+            if collector is not None:
+                collector.extend(docs)
 
             docs_to_insert = docs
             if skip_existing_search:

@@ -5,6 +5,7 @@ from __future__ import annotations
 import warnings
 from typing import Optional
 
+import pandas as pd
 import streamlit as st
 from dotenv import load_dotenv
 
@@ -23,6 +24,30 @@ from fgis_clickhouse.utils import (
 
 load_dotenv()
 warnings.filterwarnings("ignore", message="urllib3 v2 only supports OpenSSL")
+
+
+def _store_last_result(kind: str, docs) -> None:
+    """Persist last fetched docs in session for download."""
+    if not docs:
+        return
+    st.session_state["last_result"] = {"kind": kind, "docs": list(docs)}
+
+
+def render_last_download() -> None:
+    """Render a download button for the last query result (any tab)."""
+    payload = st.session_state.get("last_result")
+    if not payload:
+        st.caption("Нет последнего результата для выгрузки в CSV.")
+        return
+    df = pd.DataFrame(payload["docs"])
+    csv = df.to_csv(index=False).encode("utf-8")
+    kind = payload.get("kind", "result")
+    st.download_button(
+        f"⬇️ Скачать последний результат ({kind.upper()}, {len(df)} строк)",
+        data=csv,
+        file_name=f"{kind}_last.csv",
+        mime="text/csv",
+    )
 
 
 def run_vri_tab(ch: Optional[CH], client: FGISClient, tag: str) -> None:
@@ -52,6 +77,7 @@ def run_vri_tab(ch: Optional[CH], client: FGISClient, tag: str) -> None:
     is_connected = ch is not None
     run_vri = st.button("▶ Запустить поиск и загрузку", key="btn_vri", disabled=not is_connected)
     if run_vri and ch is not None:
+        collected_vri = []
         run_id = f"vri-{ts_compact()}"
         since_iso = try_parse_since(since_txt)
         batches = collect_vri_batches(
@@ -80,8 +106,10 @@ def run_vri_tab(ch: Optional[CH], client: FGISClient, tag: str) -> None:
             skip_existing_details=skip_existing_details,
             run_id=run_id,
             tag=tag,
+            collector=collected_vri,
         )
         st.success(f"Готово. Новых VRI={new_rows}, распарсено={parsed}, mieta={mieta}, mis={mis}, run_id={run_id}")
+        _store_last_result("vri", collected_vri)
     elif run_vri and not is_connected:
         st.error("Сначала подключитесь к ClickHouse.")
 
@@ -111,6 +139,7 @@ def run_mit_tab(ch: Optional[CH], client: FGISClient, tag: str) -> None:
     is_connected = ch is not None
     run_mit = st.button("▶ Запустить поиск по типам", key="btn_mit", disabled=not is_connected)
     if run_mit and ch is not None:
+        collected_mit = []
         batches = collect_mit_batches(manufacturer, title, notation, df_mit)
         if not batches:
             st.error("Нужен изготовитель в форме или файл.")
@@ -129,8 +158,10 @@ def run_mit_tab(ch: Optional[CH], client: FGISClient, tag: str) -> None:
                 skip_existing_details=skip_existing_mdet,
                 run_id=run_id,
                 tag=tag,
+                collector=collected_mit,
             )
             st.success(f"Готово. Новых MIT={new_rows}, деталей={details}, run_id={run_id}")
+            _store_last_result("mit", collected_mit)
     elif run_mit and not is_connected:
         st.error("Сначала подключитесь к ClickHouse.")
 
@@ -158,6 +189,7 @@ def run_mit_tab(ch: Optional[CH], client: FGISClient, tag: str) -> None:
             st.info(f"Обрабатываем {len(numbers)} типов СИ.")
             batches = [(number, None, None) for number in numbers]
             run_id = f"vri-from-mit-{ts_compact()}"
+            collected_bridge = []
             new_rows, parsed, mieta, mis = ingest_vri(
                 ch,
                 client,
@@ -174,10 +206,12 @@ def run_mit_tab(ch: Optional[CH], client: FGISClient, tag: str) -> None:
                 skip_existing_details=skip_existing_details_bridge,
                 run_id=run_id,
                 tag=tag,
+                collector=collected_bridge,
             )
             st.success(
                 f"Готово. Новых VRI={new_rows}, распарсено={parsed}, mieta={mieta}, mis={mis}, run_id={run_id}"
             )
+            _store_last_result("vri", collected_bridge)
     elif load_vri_btn and not is_connected:
         st.error("Сначала подключитесь к ClickHouse.")
 
@@ -197,8 +231,10 @@ def main() -> None:
     tab_vri, tab_mit = st.tabs(["🔎 Поверки (VRI)", "📚 Утверждения типов (MIT)"])
     with tab_vri:
         run_vri_tab(ch, client, tag)
+        render_last_download()
     with tab_mit:
         run_mit_tab(ch, client, tag)
+        render_last_download()
 
 
 if __name__ == "__main__":

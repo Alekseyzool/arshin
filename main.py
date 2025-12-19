@@ -44,7 +44,7 @@ def run_analytics_tab(ch: Optional[CH]) -> None:
         st.caption("Можно указать несколько фирм через +, например: VXI+Информ")
         only_applicable = st.checkbox("Только пригодные поверки (applicability=1)", True, key="ana_applicable")
     with col2:
-        use_year_filter = st.checkbox("Фильтр по годам поверок", False, key="ana_year_filter")
+        use_year_filter = st.checkbox("Фильтр по годам", False, key="ana_year_filter")
         if use_year_filter:
             default_from = max(1900, date.today().year - 5)
             year_from = st.number_input("Год с", 1900, 2100, default_from, key="ana_year_from")
@@ -52,6 +52,13 @@ def run_analytics_tab(ch: Optional[CH]) -> None:
         else:
             year_from = None
             year_to = None
+        mit_type_label = st.selectbox(
+            "Тип утверждения",
+            ("Любой", "Серийное", "Единичное"),
+            index=0,
+            key="ana_mit_type",
+        )
+        mit_type = {"Любой": None, "Серийное": "serial", "Единичное": "single"}[mit_type_label]
     with col3:
         export_limit = st.number_input("Лимит выгрузки (строк)", 100, 1_000_000, 5000, key="ana_limit")
         top_n = st.number_input("ТОП N", 5, 100, 20, key="ana_top")
@@ -66,7 +73,13 @@ def run_analytics_tab(ch: Optional[CH]) -> None:
         if not manufacturer_term.strip():
             st.warning("Введите часть названия производителя.")
         else:
-            mit_count = count_mit_for_manufacturer(ch, manufacturer_term)
+            mit_count = count_mit_for_manufacturer(
+                ch,
+                manufacturer_term,
+                int(year_from) if year_from else None,
+                int(year_to) if year_to else None,
+                mit_type,
+            )
             vri_count = count_vri_for_manufacturer(
                 ch,
                 manufacturer_term,
@@ -79,7 +92,14 @@ def run_analytics_tab(ch: Optional[CH]) -> None:
             m2.metric("Поверок приборов", vri_count)
 
             st.markdown("### Утверждения типа (отчет по фирмам)")
-            report_mit_cols, report_mit_rows = report_mit_by_manufacturer(ch, manufacturer_term, int(top_n))
+            report_mit_cols, report_mit_rows = report_mit_by_manufacturer(
+                ch,
+                manufacturer_term,
+                int(year_from) if year_from else None,
+                int(year_to) if year_to else None,
+                mit_type,
+                int(top_n),
+            )
             df_report_mit = pd.DataFrame(report_mit_rows, columns=report_mit_cols)
             if df_report_mit.empty:
                 st.info("Нет данных по утверждениям типа.")
@@ -95,7 +115,14 @@ def run_analytics_tab(ch: Optional[CH]) -> None:
                 )
 
             st.markdown("### Утверждения типа (выгрузка)")
-            mit_cols, mit_rows = query_mit_for_manufacturer(ch, manufacturer_term, int(export_limit))
+            mit_cols, mit_rows = query_mit_for_manufacturer(
+                ch,
+                manufacturer_term,
+                int(year_from) if year_from else None,
+                int(year_to) if year_to else None,
+                mit_type,
+                int(export_limit),
+            )
             df_mit = pd.DataFrame(mit_rows, columns=mit_cols)
             if df_mit.empty:
                 st.info("Нет данных по утверждениям типа.")
@@ -158,7 +185,13 @@ def run_analytics_tab(ch: Optional[CH]) -> None:
 
     if run_top:
         st.markdown("### ТОП производителей по утверждениям типа")
-        top_mit_cols, top_mit_rows = top_manufacturers_by_mit(ch, int(top_n))
+        top_mit_cols, top_mit_rows = top_manufacturers_by_mit(
+            ch,
+            int(top_n),
+            int(year_from) if year_from else None,
+            int(year_to) if year_to else None,
+            mit_type,
+        )
         df_top_mit = pd.DataFrame(top_mit_rows, columns=top_mit_cols)
         if df_top_mit.empty:
             st.info("Нет данных по утверждениям типа.")

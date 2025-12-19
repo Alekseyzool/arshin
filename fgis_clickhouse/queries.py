@@ -41,8 +41,44 @@ def _year_filter(column: str, year_from: Optional[int], year_to: Optional[int]) 
     return "1"
 
 
-def count_mit_for_manufacturer(ch: CH, manufacturer_term: str) -> int:
+def _mit_year_filter(year_from: Optional[int], year_to: Optional[int]) -> str:
+    if not year_from and not year_to:
+        return "1"
+    y_from = int(year_from) if year_from else int(year_to)
+    y_to = int(year_to) if year_to else int(year_from)
+    if y_from > y_to:
+        y_from, y_to = y_to, y_from
+    order_cond = _year_filter("order_date", y_from, y_to)
+    year_part = "splitByChar('-', mit_number)[-1]"
+    year_num = f"toInt32OrZero({year_part})"
+    cond_2 = f"(length({year_part}) = 2 AND (2000 + {year_num}) BETWEEN {y_from} AND {y_to})"
+    cond_4 = f"(length({year_part}) = 4 AND {year_num} BETWEEN {y_from} AND {y_to})"
+    num_cond = f"({cond_2} OR {cond_4})"
+    return f"(({order_cond}) OR ({num_cond}))"
+
+
+def _mit_type_filter(approval_type: Optional[str]) -> str:
+    if approval_type == "serial":
+        return "production_type = 1"
+    if approval_type == "single":
+        return "production_type != 1"
+    return "1"
+
+
+def count_mit_for_manufacturer(
+    ch: CH,
+    manufacturer_term: str,
+    year_from: Optional[int],
+    year_to: Optional[int],
+    approval_type: Optional[str],
+) -> int:
     where = _manufacturer_filter(manufacturer_term)
+    year_sql = _mit_year_filter(year_from, year_to)
+    if year_sql != "1":
+        where += f" AND {year_sql}"
+    type_sql = _mit_type_filter(approval_type)
+    if type_sql != "1":
+        where += f" AND {type_sql}"
     sql = f"SELECT countDistinct(mit_number) FROM {ch.db}.mit_registry WHERE {where}"
     return int(ch.scalar(sql) or 0)
 
@@ -64,16 +100,39 @@ def count_vri_for_manufacturer(
     return int(ch.scalar(sql) or 0)
 
 
-def query_mit_for_manufacturer(ch: CH, manufacturer_term: str, limit: int) -> Tuple[List[str], Sequence[Tuple[object, ...]]]:
+def query_mit_for_manufacturer(
+    ch: CH,
+    manufacturer_term: str,
+    year_from: Optional[int],
+    year_to: Optional[int],
+    approval_type: Optional[str],
+    limit: int,
+) -> Tuple[List[str], Sequence[Tuple[object, ...]]]:
     where = _manufacturer_filter(manufacturer_term)
+    year_sql = _mit_year_filter(year_from, year_to)
+    if year_sql != "1":
+        where += f" AND {year_sql}"
+    type_sql = _mit_type_filter(approval_type)
+    if type_sql != "1":
+        where += f" AND {type_sql}"
     sql = (
-        "SELECT mit_number, mit_title, notation, manufacturer, country, production_type, is_actual, valid_to "
+        "SELECT mit_number, mit_title, notation, manufacturer, country, production_type, is_actual, order_date, valid_to "
         f"FROM {ch.db}.mit_registry WHERE {where} "
         "ORDER BY mit_number DESC "
         f"LIMIT {int(limit)}"
     )
     return (
-        ["mit_number", "mit_title", "notation", "manufacturer", "country", "production_type", "is_actual", "valid_to"],
+        [
+            "mit_number",
+            "mit_title",
+            "notation",
+            "manufacturer",
+            "country",
+            "production_type",
+            "is_actual",
+            "order_date",
+            "valid_to",
+        ],
         ch.rows(sql),
     )
 
@@ -117,10 +176,23 @@ def query_vri_for_manufacturer(
     )
 
 
-def top_manufacturers_by_mit(ch: CH, limit: int) -> Tuple[List[str], Sequence[Tuple[object, ...]]]:
+def top_manufacturers_by_mit(
+    ch: CH,
+    limit: int,
+    year_from: Optional[int],
+    year_to: Optional[int],
+    approval_type: Optional[str],
+) -> Tuple[List[str], Sequence[Tuple[object, ...]]]:
+    where = "manufacturer != ''"
+    year_sql = _mit_year_filter(year_from, year_to)
+    if year_sql != "1":
+        where += f" AND {year_sql}"
+    type_sql = _mit_type_filter(approval_type)
+    if type_sql != "1":
+        where += f" AND {type_sql}"
     sql = (
         "SELECT manufacturer, countDistinct(mit_number) AS approvals "
-        f"FROM {ch.db}.mit_registry WHERE manufacturer != '' "
+        f"FROM {ch.db}.mit_registry WHERE {where} "
         "GROUP BY manufacturer ORDER BY approvals DESC "
         f"LIMIT {int(limit)}"
     )
@@ -152,9 +224,18 @@ def top_manufacturers_by_vri(
 def report_mit_by_manufacturer(
     ch: CH,
     manufacturer_term: str,
+    year_from: Optional[int],
+    year_to: Optional[int],
+    approval_type: Optional[str],
     limit: int,
 ) -> Tuple[List[str], Sequence[Tuple[object, ...]]]:
     where = _manufacturer_filter(manufacturer_term)
+    year_sql = _mit_year_filter(year_from, year_to)
+    if year_sql != "1":
+        where += f" AND {year_sql}"
+    type_sql = _mit_type_filter(approval_type)
+    if type_sql != "1":
+        where += f" AND {type_sql}"
     sql = (
         "SELECT manufacturer, countDistinct(mit_number) AS approvals "
         f"FROM {ch.db}.mit_registry WHERE {where} "

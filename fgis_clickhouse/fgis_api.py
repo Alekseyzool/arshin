@@ -14,6 +14,7 @@ VRI_FL = (
     "vri_id,org_title,mi.mitnumber,mi.mititle,mi.mitype,mi.modification,mi.number,"
     "verification_date,valid_date,applicability,result_docnum,sticker_num"
 )
+MIT_LIST_FL = "mit_uuid,number,title,notation,num1,num2,manufacturers"
 VRI_SEARCH_BASE = "https://fgis.gost.ru/fundmetrology/cm/xcdb/vri/select"
 VRI_DETAILS_BASE = "https://fgis.gost.ru/fundmetrology/cm/iaux/vri/{vri_id}"
 MIT_SEARCH_BASE = "https://fgis.gost.ru/fundmetrology/cm/xcdb/mit24/list"
@@ -113,3 +114,60 @@ class FGISClient:
         payload = self._http.json(url)
         docs = (payload.get("response") or {}).get("docs") or []
         return docs[0] if docs else {}
+
+    def mit_list_cursor(
+        self,
+        *,
+        cursor_mark: str,
+        rows: int,
+        sort: str = "num1 desc, mit_uuid desc",
+    ) -> Tuple[List[Dict[str, str]], Optional[str]]:
+        """Stream the full MIT list with cursorMark-based pagination."""
+        sort_param = sort.replace(" ", "+")
+        params = [
+            "q=*",
+            f"fl={MIT_LIST_FL}",
+            f"rows={rows}",
+            "sort=" + request_utils.quote(sort_param, safe=",+"),
+            "cursorMark=" + request_utils.quote(cursor_mark, safe="*"),
+        ]
+        url = MIT_SEARCH_BASE + "?" + "&".join(params)
+        payload = self._http.json(url)
+        response = payload.get("response") or {}
+        docs = response.get("docs") or []
+        return docs, payload.get("nextCursorMark")
+
+    def vri_count(self, fq: Optional[str]) -> int:
+        """Return numFound for a VRI query without fetching any documents."""
+        params = ["q=*", "rows=0"]
+        if fq:
+            params.append("fq=" + request_utils.quote(fq, safe=":*[]/ "))
+        url = VRI_SEARCH_BASE + "?" + "&".join(params)
+        payload = self._http.json(url)
+        response = payload.get("response") or {}
+        return int(response.get("numFound", 0))
+
+    def vri_cursor(
+        self,
+        *,
+        fq: Optional[str],
+        rows: int,
+        cursor_mark: str,
+        sort: str = "vri_id asc",
+    ) -> Tuple[List[Dict[str, str]], int, Optional[str]]:
+        """Fetch a cursorMark page for VRI and return docs, numFound, nextCursorMark."""
+        sort_param = sort.replace(" ", "+")
+        params = [
+            "q=*",
+            f"fl={VRI_FL}",
+            f"rows={rows}",
+            "sort=" + request_utils.quote(sort_param, safe=",+"),
+            "cursorMark=" + request_utils.quote(cursor_mark, safe="*"),
+        ]
+        if fq:
+            params.append("fq=" + request_utils.quote(fq, safe=":*[]/ "))
+        url = VRI_SEARCH_BASE + "?" + "&".join(params)
+        payload = self._http.json(url)
+        response = payload.get("response") or {}
+        docs = response.get("docs") or []
+        return docs, int(response.get("numFound", 0)), payload.get("nextCursorMark")

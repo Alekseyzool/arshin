@@ -4,7 +4,6 @@ from .clickhouse_io import CH, ensure_tables
 from .fgis_api import FGISClient
 from .ingestion import ingest_mit, ingest_vri
 from .parsing import parse_vri_payload
-from .queries import distinct_mit_numbers
 from .ui_helpers import ch_connect_from_sidebar, read_optional_dataframe
 from .utils import (
     BatchMIT,
@@ -31,7 +30,6 @@ __all__ = [
     "collect_vri_batches",
     "BatchMIT",
     "BatchVRI",
-    "distinct_mit_numbers",
     "h64",
     "parse_date_ddmmyyyy",
     "parse_dt_value",

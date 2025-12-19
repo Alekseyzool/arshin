@@ -83,105 +83,38 @@ def ensure_tables(ch: CH) -> None:
     ddl_statements = [
         f"CREATE DATABASE IF NOT EXISTS {db}",
         f"""
-        CREATE TABLE IF NOT EXISTS {db}.vri_search_raw (
-            vri_id String,
-            org_title String,
-            mi_mitnumber String,
-            mi_mititle String,
-            mi_mitype String,
+        CREATE TABLE IF NOT EXISTS {db}.mit_registry (
+            country String,
+            inserted_at DateTime DEFAULT now(),
+            is_actual UInt8,
+            manufacturer String,
+            mit_number String,
+            mit_title String,
+            mpi String,
+            notation String,
+            order_date Nullable(Date),
+            order_num String,
+            production_type UInt8,
+            valid_to Nullable(Date)
+        ) ENGINE = ReplacingMergeTree(inserted_at)
+        ORDER BY mit_number
+        """,
+        f"""
+        CREATE TABLE IF NOT EXISTS {db}.verifications (
+            applicability UInt8,
+            inserted_at DateTime DEFAULT now(),
             mi_modification String,
             mi_number String,
-            verification_date DateTime DEFAULT toDateTime(0),
-            valid_date        DateTime DEFAULT toDateTime(0),
-            applicability UInt8,
-            result_docnum String,
-            sticker_num String,
-            run_id String,
-            source_tag String,
-            ingest_ts DateTime DEFAULT now(),
-            ver UInt64 DEFAULT toUnixTimestamp(now())
-        ) ENGINE = ReplacingMergeTree(ver)
+            mit_notation String,
+            mit_number String,
+            mit_title String,
+            org_title LowCardinality(String),
+            valid_date Nullable(Date),
+            verification_date Date,
+            vri_id String
+        ) ENGINE = ReplacingMergeTree(inserted_at)
         PARTITION BY toYYYYMM(verification_date)
-        ORDER BY vri_id
-        """,
-        f"""
-        CREATE TABLE IF NOT EXISTS {db}.vri_details_raw (
-            vri_id String,
-            payload_json String,
-            payload_hash UInt64,
-            run_id String,
-            source_tag String,
-            ingest_ts DateTime DEFAULT now(),
-            ver UInt64 DEFAULT toUnixTimestamp(now())
-        ) ENGINE = ReplacingMergeTree(ver)
-        ORDER BY vri_id
-        """,
-        f"""
-        CREATE TABLE IF NOT EXISTS {db}.vri_details (
-            vri_id String,
-            mitype_number String,
-            mitype_type String,
-            mitype_title String,
-            mitype_url String,
-            manufacture_num String,
-            manufacture_year Int32,
-            modification String,
-            org_title String,
-            sign_cipher String,
-            mi_owner String,
-            vri_type String,
-            vri_type_label String,
-            vrf_date Date,
-            valid_date Date,
-            doc_title String,
-            applicable_cert_num String,
-            applicable_sign_pass UInt8,
-            applicable_sign_mi UInt8,
-            brief_indicator UInt8,
-            run_id String,
-            source_tag String,
-            ingest_ts DateTime DEFAULT now(),
-            ver UInt64 DEFAULT toUnixTimestamp(now())
-        ) ENGINE = ReplacingMergeTree(ver)
-        PARTITION BY toYYYYMM(vrf_date)
-        ORDER BY vri_id
-        """,
-        f"""
-        CREATE TABLE IF NOT EXISTS {db}.vri_mieta (
-            vri_id String,
-            reg_number String,
-            mitype_number String,
-            mitype_title String,
-            mitype_url String,
-            notation String,
-            modification String,
-            manufacture_num String,
-            manufacture_year Int32,
-            rank_code String,
-            rank_title String,
-            schema_title String,
-            row_hash UInt64,
-            run_id String,
-            source_tag String,
-            ingest_ts DateTime DEFAULT now(),
-            ver UInt64 DEFAULT toUnixTimestamp(now())
-        ) ENGINE = ReplacingMergeTree(ver)
-        ORDER BY (vri_id, reg_number)
-        """,
-        f"""
-        CREATE TABLE IF NOT EXISTS {db}.vri_mis (
-            vri_id String,
-            mitype_number String,
-            mitype_title String,
-            mitype_url String,
-            number String,
-            row_hash UInt64,
-            run_id String,
-            source_tag String,
-            ingest_ts DateTime DEFAULT now(),
-            ver UInt64 DEFAULT toUnixTimestamp(now())
-        ) ENGINE = ReplacingMergeTree(ver)
-        ORDER BY (vri_id, mitype_number, number)
+        ORDER BY (verification_date, vri_id)
         """,
     ]
 
@@ -200,26 +133,23 @@ def ensure_tables(ch: CH) -> None:
             v.vri_id,
             v.verification_date,
             v.valid_date,
+            v.applicability,
             v.org_title,
-            v.mi_mitnumber,
-            v.mi_mititle,
-            v.mi_mitype,
+            v.mit_number,
+            v.mit_title,
+            v.mit_notation,
             v.mi_modification,
             v.mi_number,
-            m.mit_uuid,
-            m.title AS mit_title,
-            m.notation AS mit_notation,
-            m.manufacturers
-        FROM {db}.vri_search_raw AS v
+            m.manufacturer,
+            m.country
+        FROM {db}.verifications AS v
         ANY LEFT JOIN (
             SELECT
-                mit_uuid,
-                title,
-                notation,
-                manufacturers,
-                number,
-                replaceRegexpAll(number, '\\\\s+', '') AS number_clean
-            FROM {db}.mit_search_raw
-        ) AS m ON replaceRegexpAll(v.mi_mitnumber, '\\\\s+', '') = m.number_clean
+                mit_number,
+                manufacturer,
+                country,
+                replaceRegexpAll(mit_number, '\\\\s+', '') AS number_clean
+            FROM {db}.mit_registry
+        ) AS m ON replaceRegexpAll(v.mit_number, '\\\\s+', '') = m.number_clean
         """
     )

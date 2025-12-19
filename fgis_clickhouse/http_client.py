@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import random
 import time
 from dataclasses import dataclass
@@ -15,6 +16,7 @@ UA_POOL = [
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36",
 ]
 MIN_RPS = 0.2
+RETRY_STATUSES = {429, 500, 502, 503, 504}
 
 
 def _headers() -> Dict[str, str]:
@@ -38,13 +40,28 @@ class HttpClient:
         self._session = requests.Session()
         self._rps = max(self.rps, MIN_RPS)
         self._proxies = {"http": self.proxy, "https": self.proxy} if self.proxy else None
+        self._max_retries = max(1, int(os.getenv("HTTP_MAX_RETRIES", "5")))
+        self._base_sleep = float(os.getenv("HTTP_BASE_SLEEP", "1.0"))
+        self._max_sleep = float(os.getenv("HTTP_MAX_SLEEP", "30.0"))
 
     def json(self, url: str) -> Dict[str, Any]:
         """Fetch JSON with throttling and shared session."""
-        delay = random.uniform(0, 1.0 / self._rps)
-        if delay > 0:
-            time.sleep(delay)
-        response = self._session.get(url, headers=_headers(), timeout=self.timeout, proxies=self._proxies)
-        response.raise_for_status()
-        return response.json()
-
+        last_err: Optional[Exception] = None
+        for attempt in range(self._max_retries):
+            delay = random.uniform(0, 1.0 / self._rps)
+            if delay > 0:
+                time.sleep(delay)
+            try:
+                response = self._session.get(url, headers=_headers(), timeout=self.timeout, proxies=self._proxies)
+                if response.status_code == 200:
+                    return response.json()
+                if response.status_code in RETRY_STATUSES:
+                    sleep_s = min(self._max_sleep, self._base_sleep * (2**attempt)) + random.random()
+                    time.sleep(sleep_s)
+                    continue
+                response.raise_for_status()
+            except Exception as exc:
+                last_err = exc
+                sleep_s = min(self._max_sleep, self._base_sleep * (2**attempt)) + random.random()
+                time.sleep(sleep_s)
+        raise RuntimeError(f"Failed after {self._max_retries} retries: {last_err}")

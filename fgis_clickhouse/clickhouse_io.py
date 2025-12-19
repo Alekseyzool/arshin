@@ -116,6 +116,15 @@ def ensure_tables(ch: CH) -> None:
         PARTITION BY toYYYYMM(verification_date)
         ORDER BY (verification_date, vri_id)
         """,
+        f"""
+        CREATE TABLE IF NOT EXISTS {db}.sync_state (
+            key String,
+            last_run DateTime,
+            updated_at DateTime DEFAULT now(),
+            ver UInt64 DEFAULT toUnixTimestamp(now())
+        ) ENGINE = ReplacingMergeTree(ver)
+        ORDER BY key
+        """,
     ]
 
     for ddl in ddl_statements:

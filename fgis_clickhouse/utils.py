@@ -233,3 +233,39 @@ def try_parse_since(value: str) -> Optional[str]:
         except ValueError:
             return None
     return clean
+
+
+def normalize_manufacturer_name(raw: str) -> str:
+    """Normalize manufacturer names for reporting/aggregation."""
+    text = str(raw or "").strip()
+    if not text:
+        return ""
+    upper = text.upper()
+    if "ВНИИФТРИ" in upper:
+        return "ВНИИФТРИ"
+    if "ВНИИМ" in upper:
+        return "ВНИИМ"
+    if "РОСТЕСТ" in upper:
+        return "Ростест-Москва"
+    if "KEYSIGHT" in upper:
+        return "Keysight"
+    if "ROHDE" in upper:
+        return "Rohde & Schwarz"
+    if "SIGLENT" in upper:
+        return "Siglent"
+    if "RIGOL" in upper:
+        return "Rigol"
+    if re.search(r"ИНФОРМТЕСТ|INFORMTEST|INFTEST", upper):
+        return "Информтест"
+    if re.search(r"\bVXI\b", upper) or "VXI-" in upper or "VXI " in upper:
+        return "VXI-Системы"
+
+    text = text.split(",")[0].strip()
+    brackets = re.findall(r"\(([^)]+)\)", text)
+    if brackets:
+        text = brackets[-1].strip()
+    text = re.sub(r"[\"«»]", "", text).strip()
+    text = re.sub(r"^(ООО|АО|ПАО|ЗАО|ОАО|ФГУП|ГУП|ФГБУ|ФБУ)\s+", "", text, flags=re.I).strip()
+    text = re.sub(r"\b(ООО|АО|ПАО|ЗАО|ОАО|ФГУП|ГУП|ФГБУ|ФБУ)\b", "", text, flags=re.I).strip()
+    text = re.sub(r"\b(Company|Co\.|Ltd\.?|Inc\.?|GmbH|Sdn\.?\s*Bhd\.?)\b", "", text, flags=re.I).strip()
+    return text or str(raw or "").strip()

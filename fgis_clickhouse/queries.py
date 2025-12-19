@@ -6,6 +6,7 @@ import re
 from typing import List, Optional, Sequence, Tuple
 
 from .clickhouse_io import CH
+from .utils import normalize_manufacturer_name
 
 
 def _escape_literal(value: str) -> str:
@@ -28,6 +29,26 @@ def _manufacturer_filter(term: str) -> str:
     if len(clauses) == 1:
         return clauses[0]
     return "(" + " OR ".join(clauses) + ")"
+
+
+def _aggregate_by_normalized(
+    rows: Sequence[Tuple[object, ...]],
+    *,
+    name_idx: int,
+    value_idx: int,
+    limit: int,
+) -> List[Tuple[str, int]]:
+    totals: dict[str, int] = {}
+    for row in rows:
+        if not row:
+            continue
+        name = str(row[name_idx] or "")
+        value = int(row[value_idx] or 0)
+        normalized = normalize_manufacturer_name(name)
+        if not normalized:
+            continue
+        totals[normalized] = totals.get(normalized, 0) + value
+    return sorted(totals.items(), key=lambda item: item[1], reverse=True)[:limit]
 
 
 def _year_filter(column: str, year_from: Optional[int], year_to: Optional[int]) -> str:
@@ -63,6 +84,33 @@ def _mit_type_filter(approval_type: Optional[str]) -> str:
     if approval_type == "single":
         return "production_type != 1"
     return "1"
+
+
+def _mit_clean_expr(column: str) -> str:
+    return f"replaceRegexpAll({column}, '\\\\s+', '')"
+
+
+def _vri_agg_subquery(
+    db: str,
+    year_from: Optional[int],
+    year_to: Optional[int],
+    only_applicable: bool,
+) -> str:
+    where = []
+    if only_applicable:
+        where.append("applicability = 1")
+    year_sql = _year_filter("verification_date", year_from, year_to)
+    if year_sql != "1":
+        where.append(year_sql)
+    where_sql = " AND ".join(where) if where else "1"
+    return (
+        "SELECT "
+        f"{_mit_clean_expr('mit_number')} AS mit_clean, "
+        "countDistinct(vri_id) AS verifications "
+        f"FROM {db}.verifications "
+        f"WHERE {where_sql} "
+        "GROUP BY mit_clean"
+    )
 
 
 def count_mit_for_manufacturer(
@@ -190,13 +238,16 @@ def top_manufacturers_by_mit(
     type_sql = _mit_type_filter(approval_type)
     if type_sql != "1":
         where += f" AND {type_sql}"
+    raw_limit = max(int(limit) * 50, 1000)
     sql = (
         "SELECT manufacturer, countDistinct(mit_number) AS approvals "
         f"FROM {ch.db}.mit_registry WHERE {where} "
         "GROUP BY manufacturer ORDER BY approvals DESC "
-        f"LIMIT {int(limit)}"
+        f"LIMIT {raw_limit}"
     )
-    return (["manufacturer", "approvals"], ch.rows(sql))
+    rows = ch.rows(sql)
+    merged = _aggregate_by_normalized(rows, name_idx=0, value_idx=1, limit=int(limit))
+    return (["manufacturer", "approvals"], merged)
 
 
 def top_manufacturers_by_vri(
@@ -206,19 +257,24 @@ def top_manufacturers_by_vri(
     year_to: Optional[int],
     only_applicable: bool,
 ) -> Tuple[List[str], Sequence[Tuple[object, ...]]]:
-    where = "manufacturer != ''"
-    if only_applicable:
-        where += " AND applicability = 1"
-    year_sql = _year_filter("verification_date", year_from, year_to)
-    if year_sql != "1":
-        where += f" AND {year_sql}"
+    raw_limit = max(int(limit) * 50, 1000)
+    vri_sql = _vri_agg_subquery(ch.db, year_from, year_to, only_applicable)
     sql = (
-        "SELECT manufacturer, countDistinct(vri_id) AS verifications "
-        f"FROM {ch.db}.v_vri_with_type WHERE {where} "
-        "GROUP BY manufacturer ORDER BY verifications DESC "
-        f"LIMIT {int(limit)}"
+        "SELECT m.manufacturer, sum(v.verifications) AS verifications "
+        f"FROM ({vri_sql}) AS v "
+        "ANY LEFT JOIN ("
+        "SELECT "
+        f"{_mit_clean_expr('mit_number')} AS mit_clean, "
+        "manufacturer "
+        f"FROM {ch.db}.mit_registry"
+        ") AS m USING mit_clean "
+        "WHERE m.manufacturer != '' "
+        "GROUP BY m.manufacturer ORDER BY verifications DESC "
+        f"LIMIT {raw_limit}"
     )
-    return (["manufacturer", "verifications"], ch.rows(sql))
+    rows = ch.rows(sql)
+    merged = _aggregate_by_normalized(rows, name_idx=0, value_idx=1, limit=int(limit))
+    return (["manufacturer", "verifications"], merged)
 
 
 def report_mit_by_manufacturer(
@@ -236,13 +292,16 @@ def report_mit_by_manufacturer(
     type_sql = _mit_type_filter(approval_type)
     if type_sql != "1":
         where += f" AND {type_sql}"
+    raw_limit = max(int(limit) * 50, 1000)
     sql = (
         "SELECT manufacturer, countDistinct(mit_number) AS approvals "
         f"FROM {ch.db}.mit_registry WHERE {where} "
         "GROUP BY manufacturer ORDER BY approvals DESC "
-        f"LIMIT {int(limit)}"
+        f"LIMIT {raw_limit}"
     )
-    return (["manufacturer", "approvals"], ch.rows(sql))
+    rows = ch.rows(sql)
+    merged = _aggregate_by_normalized(rows, name_idx=0, value_idx=1, limit=int(limit))
+    return (["manufacturer", "approvals"], merged)
 
 
 def report_vri_by_manufacturer(
@@ -253,16 +312,21 @@ def report_vri_by_manufacturer(
     only_applicable: bool,
     limit: int,
 ) -> Tuple[List[str], Sequence[Tuple[object, ...]]]:
+    raw_limit = max(int(limit) * 50, 1000)
     where = _manufacturer_filter(manufacturer_term)
-    if only_applicable:
-        where += " AND applicability = 1"
-    year_sql = _year_filter("verification_date", year_from, year_to)
-    if year_sql != "1":
-        where += f" AND {year_sql}"
+    vri_sql = _vri_agg_subquery(ch.db, year_from, year_to, only_applicable)
     sql = (
-        "SELECT manufacturer, countDistinct(vri_id) AS verifications "
-        f"FROM {ch.db}.v_vri_with_type WHERE {where} "
-        "GROUP BY manufacturer ORDER BY verifications DESC "
-        f"LIMIT {int(limit)}"
+        "SELECT m.manufacturer, sum(v.verifications) AS verifications "
+        f"FROM ({vri_sql}) AS v "
+        "ANY INNER JOIN ("
+        "SELECT "
+        f"{_mit_clean_expr('mit_number')} AS mit_clean, "
+        "manufacturer "
+        f"FROM {ch.db}.mit_registry WHERE {where}"
+        ") AS m USING mit_clean "
+        "GROUP BY m.manufacturer ORDER BY verifications DESC "
+        f"LIMIT {raw_limit}"
     )
-    return (["manufacturer", "verifications"], ch.rows(sql))
+    rows = ch.rows(sql)
+    merged = _aggregate_by_normalized(rows, name_idx=0, value_idx=1, limit=int(limit))
+    return (["manufacturer", "verifications"], merged)

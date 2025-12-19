@@ -28,6 +28,13 @@ def _env_flag(name: str, default: bool = True) -> bool:
     return value.strip().lower() not in {"0", "false", "no"}
 
 
+def _env_int(name: str, default: int) -> int:
+    try:
+        return int(os.getenv(name, str(default)))
+    except Exception:
+        return default
+
+
 def parse_ymd(raw: str) -> Optional[date]:
     try:
         return datetime.strptime(raw, "%Y-%m-%d").date()
@@ -54,6 +61,27 @@ def parse_date_any(raw: Any) -> Optional[date]:
         except Exception:
             continue
     return None
+
+
+def _state_get(ch: CH, key: str) -> Optional[datetime]:
+    try:
+        value = ch.scalar(f"SELECT max(last_run) FROM {ch.db}.sync_state WHERE key = '{key}'")
+    except Exception:
+        return None
+    if isinstance(value, datetime):
+        return value
+    return None
+
+
+def _state_set(ch: CH, key: str, when: datetime) -> None:
+    ch.insert("sync_state", ["key", "last_run"], [(key, when)])
+
+
+def _should_run(ch: CH, key: str, every: timedelta, now: datetime) -> bool:
+    last = _state_get(ch, key)
+    if not last:
+        return True
+    return now - last >= every
 
 
 def _json_loads_maybe(value: Any) -> Any:
@@ -445,6 +473,39 @@ def sync_vri_range(
         cur += timedelta(days=1)
 
 
+def sync_vri_scheduled(
+    ch: CH,
+    client: FGISClient,
+    rows: int,
+    sleep_s: float,
+    skip_existing: bool,
+    start_date: Optional[date],
+    end_date: date,
+) -> None:
+    now = datetime.now()
+    schedule = [
+        ("vri_hourly", _env_int("VRI_HOURLY_EVERY_HOURS", 1), _env_int("VRI_HOURLY_DAYS", 7)),
+        ("vri_daily", _env_int("VRI_DAILY_EVERY_HOURS", 24), _env_int("VRI_DAILY_DAYS", 30)),
+        ("vri_weekly", _env_int("VRI_WEEKLY_EVERY_HOURS", 168), _env_int("VRI_WEEKLY_DAYS", 60)),
+        ("vri_monthly", _env_int("VRI_MONTHLY_EVERY_HOURS", 720), _env_int("VRI_MONTHLY_DAYS", 180)),
+    ]
+
+    for key, every_hours, days in schedule:
+        if every_hours <= 0 or days <= 0:
+            continue
+        if not _should_run(ch, key, timedelta(hours=every_hours), now):
+            continue
+        range_start = now.date() - timedelta(days=days)
+        if start_date:
+            range_start = max(range_start, start_date)
+        range_end = min(end_date, now.date())
+        if range_start > range_end:
+            continue
+        log.info("VRI schedule %s: %s → %s", key, range_start, range_end)
+        sync_vri_range(ch, client, range_start, range_end, rows, sleep_s, skip_existing)
+        _state_set(ch, key, datetime.now())
+
+
 def main() -> None:
     host = os.getenv("CH_HOST", "127.0.0.1")
     port = int(os.getenv("CH_PORT", "9001"))
@@ -471,6 +532,8 @@ def main() -> None:
     sync_vri = _env_flag("SYNC_VRI", True)
     fetch_details = _env_flag("MIT_FETCH_DETAILS", True)
     skip_existing_vri = _env_flag("VRI_SKIP_EXISTING", True)
+    vri_scheduled = _env_flag("VRI_SCHEDULED", True)
+    mit_every_hours = _env_int("MIT_EVERY_HOURS", 3)
 
     ch = CH(host, port, user, password, database)
     ensure_tables(ch)
@@ -478,19 +541,27 @@ def main() -> None:
     client = FGISClient(proxy=proxy, rps=rps)
 
     if sync_mit:
-        log.info("MIT registry sync: start")
-        total = sync_mit_registry(ch, client, mit_rows, mit_sleep, fetch_details)
-        log.info("MIT registry sync: done (inserted=%s)", total)
+        now = datetime.now()
+        if mit_every_hours <= 0 or _should_run(ch, "mit_registry", timedelta(hours=mit_every_hours), now):
+            log.info("MIT registry sync: start")
+            total = sync_mit_registry(ch, client, mit_rows, mit_sleep, fetch_details)
+            log.info("MIT registry sync: done (inserted=%s)", total)
+            _state_set(ch, "mit_registry", datetime.now())
+        else:
+            log.info("MIT registry sync: skipped by schedule")
 
     if sync_vri:
         log.info("VRI sync: start")
-        start = pick_start_date(ch, start_date, tail_days)
-        if not start:
-            log.info("VRI sync: start date is empty -> skip")
-        elif start > end_date:
-            log.info("VRI sync: start date after end date -> skip")
+        if vri_scheduled:
+            sync_vri_scheduled(ch, client, vri_rows, vri_sleep, skip_existing_vri, start_date, end_date)
         else:
-            sync_vri_range(ch, client, start, end_date, vri_rows, vri_sleep, skip_existing_vri)
+            start = pick_start_date(ch, start_date, tail_days)
+            if not start:
+                log.info("VRI sync: start date is empty -> skip")
+            elif start > end_date:
+                log.info("VRI sync: start date after end date -> skip")
+            else:
+                sync_vri_range(ch, client, start, end_date, vri_rows, vri_sleep, skip_existing_vri)
         log.info("VRI sync: done")
 
 

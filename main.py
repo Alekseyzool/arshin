@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 import warnings
 from datetime import date
 from typing import Optional
@@ -11,6 +12,7 @@ import streamlit as st
 from dotenv import load_dotenv
 
 from fgis_clickhouse.clickhouse_io import CH
+from fgis_clickhouse.reporting import ReportParams, build_word_report
 from fgis_clickhouse.queries import (
     count_mit_for_manufacturer,
     count_vri_for_manufacturer,
@@ -42,6 +44,7 @@ def run_analytics_tab(ch: Optional[CH]) -> None:
             placeholder="Например: VXI+Информ",
         )
         st.caption("Можно указать несколько фирм через +, например: VXI+Информ")
+        st.caption("Похожие названия объединяются (например, ВНИИФТРИ, Keysight).")
         only_applicable = st.checkbox("Только пригодные поверки (applicability=1)", True, key="ana_applicable")
     with col2:
         use_year_filter = st.checkbox("Фильтр по годам", False, key="ana_year_filter")
@@ -213,6 +216,63 @@ def run_analytics_tab(ch: Optional[CH]) -> None:
         else:
             st.dataframe(df_top_vri, use_container_width=True)
             st.bar_chart(df_top_vri.set_index("manufacturer")["verifications"])
+
+    st.markdown("### Word-отчет")
+    with st.expander("Сформировать Word-отчет", expanded=False):
+        default_from = int(year_from) if year_from else max(1900, date.today().year - 5)
+        default_to = int(year_to) if year_to else date.today().year
+
+        col_r1, col_r2 = st.columns(2)
+        with col_r1:
+            report_year_from = st.number_input("Год с", 1900, 2100, default_from, key="rep_year_from")
+            report_year_to = st.number_input("Год по", 1900, 2100, default_to, key="rep_year_to")
+            report_top_n = st.number_input("ТОП N (типы)", 5, 100, int(top_n), key="rep_top_n")
+            report_competitors = st.number_input("ТОП конкурентов", 5, 50, 10, key="rep_competitors")
+        with col_r2:
+            report_group = st.text_input("Название своей группы", "VXI + Информтест", key="rep_group")
+            report_regex = st.text_input("Regex для поиска своих", "VXI|Inftest|Информтест", key="rep_regex")
+            report_only_applicable = st.checkbox("Только пригодные поверки", True, key="rep_only_applicable")
+            report_serial_or_us = st.checkbox("Только серийные + наша группа", True, key="rep_serial_or_us")
+
+        mit_numbers_raw = st.text_area(
+            "MIT номера для анализа поверок (опционально, через запятую/перевод строки)",
+            "",
+            key="rep_mit_numbers",
+        )
+        mit_numbers = [item.strip() for item in re.split(r"[,\n;]+", mit_numbers_raw or "") if item.strip()]
+        mit_numbers = mit_numbers or None
+
+        if st.button("▶ Сформировать Word-отчет", key="rep_run"):
+            with st.spinner("Готовим Word-отчет..."):
+                try:
+                    params = ReportParams(
+                        year_from=int(report_year_from),
+                        year_to=int(report_year_to),
+                        our_group_name=report_group.strip() or "VXI + Информтест",
+                        our_org_regex=report_regex.strip() or "VXI|Inftest|Информтест",
+                        top_n=int(report_top_n),
+                        competitors_n=int(report_competitors),
+                        only_applicable=bool(report_only_applicable),
+                        serial_or_us=bool(report_serial_or_us),
+                        mit_numbers=mit_numbers,
+                    )
+                    report_bytes = build_word_report(ch, params)
+                    st.session_state["rep_docx"] = report_bytes
+                    st.session_state["rep_docx_name"] = (
+                        f"Отчет_типы_поверки_{int(report_year_from)}_{int(report_year_to)}.docx"
+                    )
+                    st.success("Отчет готов.")
+                except Exception as exc:  # pragma: no cover - UI feedback
+                    st.error(f"Не удалось сформировать отчет: {exc}")
+
+        if st.session_state.get("rep_docx"):
+            st.download_button(
+                "⬇️ Скачать Word-отчет",
+                data=st.session_state["rep_docx"],
+                file_name=st.session_state.get("rep_docx_name", "report.docx"),
+                mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                key="rep_download",
+            )
 
 
 def main() -> None:

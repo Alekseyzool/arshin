@@ -52,6 +52,27 @@ def ch_connect_from_sidebar() -> Optional[CH]:
         return None
 
 
+def ch_connect_auto() -> Optional[CH]:
+    """Auto-connect to ClickHouse using env vars without rendering UI."""
+    if "_ch" in st.session_state:
+        return st.session_state["_ch"]
+
+    host = os.getenv("CH_HOST", "127.0.0.1")
+    port = int(os.getenv("CH_PORT", "9001"))
+    user = os.getenv("CH_USER_READ") or os.getenv("CH_USER_INGEST") or "default"
+    password = os.getenv("CH_PASS_READ") or os.getenv("CH_PASS_INGEST") or ""
+    database = os.getenv("CH_DB", "fgis_prod")
+
+    try:
+        ch = CH(host, int(port), user, password, database)
+        st.session_state["_ch"] = ch
+        st.session_state["_ch_db"] = database
+        return ch
+    except Exception:
+        st.error("Сервис временно недоступен. Попробуйте позже.")
+        return None
+
+
 def read_optional_dataframe(uploaded_file: Optional[Any]) -> Optional[pd.DataFrame]:
     """Read uploaded CSV/XLSX and surface warning in Streamlit on failure."""
     if uploaded_file is None:
@@ -63,4 +84,3 @@ def read_optional_dataframe(uploaded_file: Optional[Any]) -> Optional[pd.DataFra
     except Exception as exc:
         st.warning(f"Не удалось прочитать файл {uploaded_file.name}: {exc}")
         return None
-

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from typing import List, Optional, Sequence, Tuple
 
 from .clickhouse_io import CH
@@ -11,9 +12,22 @@ def _escape_literal(value: str) -> str:
     return value.replace("\\", "\\\\").replace("'", "''")
 
 
+def _split_terms(raw: str) -> List[str]:
+    parts = re.split(r"[+,;|]", raw or "")
+    return [part.strip() for part in parts if part.strip()]
+
+
 def _manufacturer_filter(term: str) -> str:
-    safe = _escape_literal(term)
-    return f"positionCaseInsensitive(manufacturer, '{safe}') > 0"
+    terms = _split_terms(term)
+    if not terms:
+        return "1"
+    clauses = []
+    for item in terms:
+        safe = _escape_literal(item)
+        clauses.append(f"positionCaseInsensitive(manufacturer, '{safe}') > 0")
+    if len(clauses) == 1:
+        return clauses[0]
+    return "(" + " OR ".join(clauses) + ")"
 
 
 def _year_filter(column: str, year_from: Optional[int], year_to: Optional[int]) -> str:
@@ -121,6 +135,44 @@ def top_manufacturers_by_vri(
     only_applicable: bool,
 ) -> Tuple[List[str], Sequence[Tuple[object, ...]]]:
     where = "manufacturer != ''"
+    if only_applicable:
+        where += " AND applicability = 1"
+    year_sql = _year_filter("verification_date", year_from, year_to)
+    if year_sql != "1":
+        where += f" AND {year_sql}"
+    sql = (
+        "SELECT manufacturer, countDistinct(vri_id) AS verifications "
+        f"FROM {ch.db}.v_vri_with_type WHERE {where} "
+        "GROUP BY manufacturer ORDER BY verifications DESC "
+        f"LIMIT {int(limit)}"
+    )
+    return (["manufacturer", "verifications"], ch.rows(sql))
+
+
+def report_mit_by_manufacturer(
+    ch: CH,
+    manufacturer_term: str,
+    limit: int,
+) -> Tuple[List[str], Sequence[Tuple[object, ...]]]:
+    where = _manufacturer_filter(manufacturer_term)
+    sql = (
+        "SELECT manufacturer, countDistinct(mit_number) AS approvals "
+        f"FROM {ch.db}.mit_registry WHERE {where} "
+        "GROUP BY manufacturer ORDER BY approvals DESC "
+        f"LIMIT {int(limit)}"
+    )
+    return (["manufacturer", "approvals"], ch.rows(sql))
+
+
+def report_vri_by_manufacturer(
+    ch: CH,
+    manufacturer_term: str,
+    year_from: Optional[int],
+    year_to: Optional[int],
+    only_applicable: bool,
+    limit: int,
+) -> Tuple[List[str], Sequence[Tuple[object, ...]]]:
+    where = _manufacturer_filter(manufacturer_term)
     if only_applicable:
         where += " AND applicability = 1"
     year_sql = _year_filter("verification_date", year_from, year_to)

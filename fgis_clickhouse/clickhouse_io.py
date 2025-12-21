@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import time
+from datetime import date
 from typing import Any, Optional, Sequence, Set
 
 from .utils import chunked
@@ -72,6 +73,29 @@ class CH:
             rows = self._client.execute(
                 f"SELECT {idcol} FROM {self.db}.{table} WHERE {idcol} IN %(ids)s",
                 {"ids": tuple(group)},
+            )
+            existing.update(row[0] for row in rows)
+        return existing
+
+    def existing_ids_for_date(
+        self,
+        table: str,
+        idcol: str,
+        ids,
+        *,
+        date_col: str,
+        day: date,
+    ) -> Set[str]:
+        values = [value for value in ids if value]
+        if not values:
+            return set()
+        existing: Set[str] = set()
+        day_str = day.strftime("%Y-%m-%d")
+        for group in chunked(values, 1000):
+            rows = self._client.execute(
+                f"SELECT {idcol} FROM {self.db}.{table} "
+                f"WHERE {date_col} = toDate(%(day)s) AND {idcol} IN %(ids)s",
+                {"ids": tuple(group), "day": day_str},
             )
             existing.update(row[0] for row in rows)
         return existing

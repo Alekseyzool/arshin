@@ -497,7 +497,7 @@ def sync_vri_day(
         docs_to_insert = docs
         if skip_existing:
             ids = [doc.get("vri_id") for doc in docs if doc.get("vri_id")]
-            existing = ch.existing_ids("verifications", "vri_id", ids)
+            existing = ch.existing_ids_for_date("verifications", "vri_id", ids, date_col="verification_date", day=d)
             if existing:
                 docs_to_insert = [doc for doc in docs if doc.get("vri_id") and doc["vri_id"] not in existing]
         rows_to_insert = []

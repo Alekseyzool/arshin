@@ -1,42 +1,24 @@
 # FGIS Arshin
 
-## Описание проекта
-Бэкенд для регулярной загрузки данных ФГИС «Аршин» в ClickHouse + Streamlit-аналитика по производителям.
+## Описание
+Минимальный загрузчик ФГИС «Аршин» → ClickHouse. Скрипт скачивает утверждения типа (MIT) и поверки (VRI) в `fgis_test` и по расписанию переносит данные в `fgis_prod`.
 
-## Цель
-Автоматизировать загрузку метрологических данных из ФГИС «Аршин» в корпоративное хранилище, минимизируя ручной труд и дублирование записей.
+## Стек
+`Python`, `requests`, `clickhouse-driver`, `python-dotenv`
 
-## Стек технологий
-`Python`, `Streamlit`, `Requests`, `Pandas`, `matplotlib`, `python-docx`, `clickhouse-driver`, `python-dotenv`
+## Запуск
+1. `pip install -r requirements.txt`
+2. Скопируйте `example.env` → `.env` и заполните параметры.
+3. Запуск: `python backend_sync.py` (лучше через cron/systemd).
 
-## Функциональность
-- Бэкенд-скрипт `backend_sync.py` для инкрементального обновления `mit_registry` и `verifications`.
-- Streamlit-аналитика по производителям: количество типов, поверок, выгрузки в CSV, TOP-списки.
-- Word-отчеты по типам и поверкам с графиками.
-- Автоматическое создание таблиц и представления `v_vri_with_type` в ClickHouse.
-
-## Инструкция по запуску
-1. Создайте виртуальное окружение и установите зависимости: `pip install -r requirements.txt`.
-2. Скопируйте `example.env` в `.env`, заполните параметры ClickHouse и proxy (если нужен).
-3. Запустите фоновую синхронизацию: `python backend_sync.py` (параметры в `.env`).
-4. Запустите аналитику: `streamlit run main.py`.
-
-## Автообновление
-Бэкенд рассчитан на запуск по расписанию (cron/systemd). Внутри используется свой план:
-- ежечасно за последнюю неделю,
-- ежедневно за последний месяц,
-- еженедельно за последние 2 месяца,
-- ежемесячно за последние 6 месяцев.
-
-Настраивается переменными `VRI_*` и `MIT_EVERY_HOURS` в `.env`.  
-Если запускать задачу раз в 3 часа, "ежечасный" блок будет срабатывать каждые 3 часа.
+## Логика синхронизации
+- MIT: инкрементальный курсорный обход. Для разовой полной перепроверки включите `MIT_FULL_SCAN=1`, затем верните `0`.
+- VRI: расписание догрузки (ежечасно/ежедневно/еженедельно/ежемесячно) через переменные `VRI_*`.
+- Перенос в prod: раз в час (или по `TRANSFER_EVERY_HOURS`), только если текущий запуск прошел без ошибок.
 
 ## Структура
-- `main.py` — Streamlit-UI для аналитики по производителям.
+- `backend_sync.py` — основной загрузчик MIT/VRI + перенос в prod.
 - `fgis_clickhouse/fgis_api.py` — обращения к API ФГИС.
-- `fgis_clickhouse/http_client.py` — HTTP-клиент с ограничением RPS.
-- `fgis_clickhouse/ingestion.py` — загрузка, пагинация, прогресс.
-- `fgis_clickhouse/inserts.py` — превращение JSON в строки ClickHouse.
-- `fgis_clickhouse/utils.py` — утилиты, нормализация дат/серийников, сбор батчей.
-- `fgis_clickhouse/ui_helpers.py` — подключение к ClickHouse и чтение CSV/XLSX.
-- `backend_sync.py` — фоновая синхронизация MIT и VRI без UI.
+- `fgis_clickhouse/http_client.py` — HTTP-клиент с ограничением RPS и ретраями.
+- `fgis_clickhouse/clickhouse_io.py` — ClickHouse I/O и DDL.
+- `fgis_clickhouse/utils.py` — вспомогательные функции.

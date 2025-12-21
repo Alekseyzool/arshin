@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import os
 import time
-from typing import Any, Sequence, Set
+from typing import Any, Optional, Sequence, Set
 
 from .utils import chunked
 
@@ -77,9 +77,9 @@ class CH:
         return existing
 
 
-def ensure_tables(ch: CH) -> None:
+def ensure_tables(ch: CH, db: Optional[str] = None) -> None:
     """Create the ClickHouse schema required for ingestion jobs."""
-    db = ch.db
+    db = db or ch.db
     ddl_statements = [
         f"CREATE DATABASE IF NOT EXISTS {db}",
         f"""
@@ -130,35 +130,4 @@ def ensure_tables(ch: CH) -> None:
     for ddl in ddl_statements:
         ch.exec(ddl)
 
-    try:
-        ch.exec(f"DROP VIEW IF EXISTS {db}.v_vri_with_type")
-    except Exception:
-        ch.exec(f"DROP TABLE IF EXISTS {db}.v_vri_with_type")
-
-    ch.exec(
-        f"""
-        CREATE VIEW {db}.v_vri_with_type AS
-        SELECT
-            v.vri_id,
-            v.verification_date,
-            v.valid_date,
-            v.applicability,
-            v.org_title,
-            v.mit_number,
-            v.mit_title,
-            v.mit_notation,
-            v.mi_modification,
-            v.mi_number,
-            m.manufacturer,
-            m.country
-        FROM {db}.verifications AS v
-        ANY LEFT JOIN (
-            SELECT
-                mit_number,
-                manufacturer,
-                country,
-                replaceRegexpAll(mit_number, '\\\\s+', '') AS number_clean
-            FROM {db}.mit_registry
-        ) AS m ON replaceRegexpAll(v.mit_number, '\\\\s+', '') = m.number_clean
-        """
-    )
+    # Minimal schema only: no analytics views here.

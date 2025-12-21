@@ -1,4 +1,4 @@
-"""Backend sync: incremental MIT registry + VRI updates."""
+"""Backend sync: ingest into fgis_test and transfer to fgis_prod."""
 
 from __future__ import annotations
 
@@ -35,6 +35,13 @@ def _env_int(name: str, default: int) -> int:
         return default
 
 
+def _env_pick(*names: str, default: str = "") -> str:
+    for name in names:
+        if name in os.environ:
+            return os.environ[name]
+    return default
+
+
 def parse_ymd(raw: str) -> Optional[date]:
     try:
         return datetime.strptime(raw, "%Y-%m-%d").date()
@@ -63,6 +70,27 @@ def parse_date_any(raw: Any) -> Optional[date]:
     return None
 
 
+def parse_datetime_any(raw: Any) -> Optional[datetime]:
+    if not raw:
+        return None
+    if isinstance(raw, datetime):
+        return raw
+    if isinstance(raw, date):
+        return datetime(raw.year, raw.month, raw.day)
+    text = str(raw).strip()
+    if not text:
+        return None
+    text = text.replace("Z", "")
+    if "T" in text:
+        text = text.replace("T", " ")
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d"):
+        try:
+            return datetime.strptime(text, fmt)
+        except Exception:
+            continue
+    return None
+
+
 def _state_get(ch: CH, key: str) -> Optional[datetime]:
     try:
         value = ch.scalar(f"SELECT max(last_run) FROM {ch.db}.sync_state WHERE key = '{key}'")
@@ -75,6 +103,34 @@ def _state_get(ch: CH, key: str) -> Optional[datetime]:
 
 def _state_set(ch: CH, key: str, when: datetime) -> None:
     ch.insert("sync_state", ["key", "last_run"], [(key, when)])
+
+
+def _format_dt(value: datetime) -> str:
+    return value.strftime("%Y-%m-%d %H:%M:%S")
+
+
+def transfer_table(
+    ch_src: CH,
+    ch_dst: CH,
+    *,
+    table: str,
+    ts_col: str,
+    state_key: str,
+) -> int:
+    last = _state_get(ch_dst, state_key)
+    where = "1"
+    if last:
+        where = f"{ts_col} > toDateTime('{_format_dt(last)}')"
+    pending = int(ch_src.scalar(f"SELECT count() FROM {ch_src.db}.{table} WHERE {where}") or 0)
+    if pending == 0:
+        log.info("TRANSFER %s: no new rows", table)
+        return 0
+    ch_dst.exec(f"INSERT INTO {ch_dst.db}.{table} SELECT * FROM {ch_src.db}.{table} WHERE {where}")
+    max_src = ch_src.scalar(f"SELECT max({ts_col}) FROM {ch_src.db}.{table} WHERE {where}")
+    max_dt = parse_datetime_any(max_src) or datetime.now()
+    _state_set(ch_dst, state_key, max_dt)
+    log.info("TRANSFER %s: inserted %s", table, pending)
+    return pending
 
 
 def _should_run(ch: CH, key: str, every: timedelta, now: datetime) -> bool:
@@ -368,6 +424,7 @@ def sync_mit_registry(
     rows: int,
     sleep_s: float,
     fetch_details: bool,
+    stop_on_existing: bool,
 ) -> int:
     cursor_mark = "*"
     total = 0
@@ -379,13 +436,26 @@ def sync_mit_registry(
         existing = ch.existing_ids("mit_registry", "mit_number", numbers) if numbers else set()
         missing_docs = [doc for doc in docs if doc.get("number") and doc.get("number") not in existing]
         if not missing_docs:
-            log.info("MIT list: page has no new numbers -> stop")
-            break
+            log.info("MIT list: page has no new numbers")
+            if stop_on_existing:
+                log.info("MIT list: stop_on_existing -> stop")
+                break
+            if not next_cursor or next_cursor == cursor_mark:
+                break
+            cursor_mark = next_cursor
+            if sleep_s > 0:
+                time.sleep(sleep_s)
+            continue
         buffer: list[tuple[Any, ...]] = []
         inserted_now = 0
         for doc in missing_docs:
             mit_uuid = doc.get("mit_uuid")
-            details = client.mit_details(mit_uuid) if fetch_details and mit_uuid else {}
+            details = {}
+            if fetch_details and mit_uuid:
+                try:
+                    details = client.mit_details(mit_uuid)
+                except Exception as exc:
+                    log.warning("MIT details failed for %s: %s", mit_uuid, exc)
             row = build_mit_row(doc, details, datetime.now())
             if row:
                 buffer.append(row)
@@ -507,11 +577,12 @@ def sync_vri_scheduled(
 
 
 def main() -> None:
-    host = os.getenv("CH_HOST", "127.0.0.1")
-    port = int(os.getenv("CH_PORT", "9001"))
-    user = os.getenv("CH_USER_INGEST") or os.getenv("CH_USER_READ") or "default"
-    password = os.getenv("CH_PASS_INGEST") or os.getenv("CH_PASS_READ") or ""
-    database = os.getenv("CH_DB", "fgis")
+    host = _env_pick("CH_HOST", default="127.0.0.1")
+    port = int(_env_pick("CH_PORT", default="9001"))
+    user = _env_pick("CH_USER_INGEST", "CH_USER", "CH_USER_READ", default="default")
+    password = _env_pick("CH_PASS_INGEST", "CH_PASS", "CH_PASS_READ", default="")
+    db_test = _env_pick("CH_DB_TEST", "CH_DB", default="fgis_test").strip() or "fgis_test"
+    db_prod = _env_pick("CH_DB_PROD", default="fgis_prod").strip() or "fgis_prod"
 
     rps = float(os.getenv("FGIS_RPS", "1.0"))
     proxy = os.getenv("HTTPS_PROXY") or os.getenv("HTTP_PROXY") or None
@@ -533,36 +604,69 @@ def main() -> None:
     fetch_details = _env_flag("MIT_FETCH_DETAILS", True)
     skip_existing_vri = _env_flag("VRI_SKIP_EXISTING", True)
     vri_scheduled = _env_flag("VRI_SCHEDULED", True)
+    mit_full_scan = _env_flag("MIT_FULL_SCAN", False)
     mit_every_hours = _env_int("MIT_EVERY_HOURS", 3)
+    transfer_enabled = _env_flag("TRANSFER_TO_PROD", True)
+    transfer_every_hours = _env_int("TRANSFER_EVERY_HOURS", 1)
 
-    ch = CH(host, port, user, password, database)
-    ensure_tables(ch)
+    ch_admin = CH(host, port, user, password, "default")
+    ensure_tables(ch_admin, db_test)
+    ensure_tables(ch_admin, db_prod)
+    ch_test = CH(host, port, user, password, db_test)
+    ch_prod = CH(host, port, user, password, db_prod)
 
     client = FGISClient(proxy=proxy, rps=rps)
 
+    now = datetime.now()
+    run_ok = True
+
     if sync_mit:
-        now = datetime.now()
-        if mit_every_hours <= 0 or _should_run(ch, "mit_registry", timedelta(hours=mit_every_hours), now):
-            log.info("MIT registry sync: start")
-            total = sync_mit_registry(ch, client, mit_rows, mit_sleep, fetch_details)
-            log.info("MIT registry sync: done (inserted=%s)", total)
-            _state_set(ch, "mit_registry", datetime.now())
+        if mit_every_hours <= 0 or _should_run(ch_test, "mit_registry", timedelta(hours=mit_every_hours), now):
+            log.info("MIT registry sync (test): start")
+            try:
+                total = sync_mit_registry(ch_test, client, mit_rows, mit_sleep, fetch_details, not mit_full_scan)
+                log.info("MIT registry sync (test): done (inserted=%s)", total)
+                _state_set(ch_test, "mit_registry", datetime.now())
+            except Exception:
+                run_ok = False
+                log.exception("MIT registry sync (test): failed")
         else:
-            log.info("MIT registry sync: skipped by schedule")
+            log.info("MIT registry sync (test): skipped by schedule")
 
     if sync_vri:
-        log.info("VRI sync: start")
-        if vri_scheduled:
-            sync_vri_scheduled(ch, client, vri_rows, vri_sleep, skip_existing_vri, start_date, end_date)
-        else:
-            start = pick_start_date(ch, start_date, tail_days)
-            if not start:
-                log.info("VRI sync: start date is empty -> skip")
-            elif start > end_date:
-                log.info("VRI sync: start date after end date -> skip")
+        log.info("VRI sync (test): start")
+        try:
+            if vri_scheduled:
+                sync_vri_scheduled(ch_test, client, vri_rows, vri_sleep, skip_existing_vri, start_date, end_date)
             else:
-                sync_vri_range(ch, client, start, end_date, vri_rows, vri_sleep, skip_existing_vri)
-        log.info("VRI sync: done")
+                start = pick_start_date(ch_test, start_date, tail_days)
+                if not start:
+                    log.info("VRI sync (test): start date is empty -> skip")
+                elif start > end_date:
+                    log.info("VRI sync (test): start date after end date -> skip")
+                else:
+                    sync_vri_range(ch_test, client, start, end_date, vri_rows, vri_sleep, skip_existing_vri)
+            log.info("VRI sync (test): done")
+        except Exception:
+            run_ok = False
+            log.exception("VRI sync (test): failed")
+
+    if transfer_enabled:
+        if transfer_every_hours <= 0:
+            log.info("TRANSFER: disabled by schedule")
+        elif not _should_run(ch_prod, "transfer_prod", timedelta(hours=transfer_every_hours), now):
+            log.info("TRANSFER: skipped by schedule")
+        elif not run_ok:
+            log.warning("TRANSFER: skipped because test sync failed")
+        else:
+            log.info("TRANSFER: start")
+            try:
+                transfer_table(ch_test, ch_prod, table="mit_registry", ts_col="inserted_at", state_key="transfer_mit")
+                transfer_table(ch_test, ch_prod, table="verifications", ts_col="inserted_at", state_key="transfer_vri")
+                _state_set(ch_prod, "transfer_prod", datetime.now())
+                log.info("TRANSFER: done")
+            except Exception:
+                log.exception("TRANSFER: failed")
 
 
 if __name__ == "__main__":

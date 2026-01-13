@@ -226,6 +226,12 @@ def fq_for_day(d: date) -> str:
     return f"verification_date:[{ds}T00:00:00Z TO {ds}T23:59:59Z]"
 
 
+def fq_for_range(start: date, end: date) -> str:
+    start_s = start.strftime("%Y-%m-%d")
+    end_s = end.strftime("%Y-%m-%d")
+    return f"verification_date:[{start_s}T00:00:00Z TO {end_s}T23:59:59Z]"
+
+
 def pick_start_date(ch: CH, start_date: Optional[date], tail_days: int) -> Optional[date]:
     if start_date is None:
         try:
@@ -264,6 +270,19 @@ def local_vri_stats(ch: CH, d: date) -> tuple[int, int]:
     except Exception:
         return 0, 0
     return 0, 0
+
+
+def local_vri_rows_range(ch: CH, start: date, end: date) -> int:
+    start_s = start.strftime("%Y-%m-%d")
+    end_s = end.strftime("%Y-%m-%d")
+    sql = (
+        f"SELECT count() FROM {ch.db}.verifications "
+        f"WHERE verification_date >= toDate('{start_s}') AND verification_date <= toDate('{end_s}')"
+    )
+    try:
+        return int(ch.scalar(sql) or 0)
+    except Exception:
+        return 0
 
 
 def remote_vri_count(client: FGISClient, fq: str) -> int:
@@ -616,6 +635,84 @@ def backfill_dates(
         log.info("BACKFILL %s: done", d)
 
 
+def reconcile_vri_range(
+    ch: CH,
+    client: FGISClient,
+    start: date,
+    end: date,
+    rows: int,
+    sleep_s: float,
+    skip_existing: bool,
+    *,
+    min_days: int,
+    max_depth: int,
+    depth: int = 0,
+) -> None:
+    if start > end:
+        return
+    span = (end - start).days + 1
+    fq = fq_for_range(start, end)
+    remote_rows = remote_vri_count(client, fq)
+    if remote_rows == 0:
+        log.info("RECONCILE %s → %s: remote=0 -> skip", start, end)
+        return
+    local_rows = local_vri_rows_range(ch, start, end)
+    if local_rows == remote_rows:
+        log.info("RECONCILE %s → %s: OK (local=%s remote=%s)", start, end, local_rows, remote_rows)
+        return
+    if local_rows > remote_rows:
+        log.warning(
+            "RECONCILE %s → %s: local>%s remote=%s (skip, possible duplicates)",
+            start,
+            end,
+            local_rows,
+            remote_rows,
+        )
+        return
+    log.info(
+        "RECONCILE %s → %s: NEED SYNC (local=%s remote=%s delta=%s span=%s)",
+        start,
+        end,
+        local_rows,
+        remote_rows,
+        remote_rows - local_rows,
+        span,
+    )
+    if span <= max(1, min_days) or depth >= max_depth:
+        if span == 1:
+            log.info("RECONCILE %s: backfill day", start)
+            sync_vri_day(ch, client, start, rows, sleep_s, skip_existing, remote_total=remote_rows)
+        else:
+            log.info("RECONCILE %s → %s: backfill range", start, end)
+            sync_vri_range(ch, client, start, end, rows, sleep_s, skip_existing)
+        return
+    mid = start + timedelta(days=(span - 1) // 2)
+    reconcile_vri_range(
+        ch,
+        client,
+        start,
+        mid,
+        rows,
+        sleep_s,
+        skip_existing,
+        min_days=min_days,
+        max_depth=max_depth,
+        depth=depth + 1,
+    )
+    reconcile_vri_range(
+        ch,
+        client,
+        mid + timedelta(days=1),
+        end,
+        rows,
+        sleep_s,
+        skip_existing,
+        min_days=min_days,
+        max_depth=max_depth,
+        depth=depth + 1,
+    )
+
+
 def sync_vri_scheduled(
     ch: CH,
     client: FGISClient,
@@ -676,6 +773,7 @@ def main() -> None:
 
     sync_mit = _env_flag("SYNC_MIT", True)
     sync_vri = _env_flag("SYNC_VRI", True)
+    reconcile_vri = _env_flag("RECONCILE_VRI", False)
     fetch_details = _env_flag("MIT_FETCH_DETAILS", True)
     skip_existing_vri = _env_flag("VRI_SKIP_EXISTING", True)
     vri_scheduled = _env_flag("VRI_SCHEDULED", True)
@@ -683,6 +781,12 @@ def main() -> None:
     mit_every_hours = _env_int("MIT_EVERY_HOURS", 3)
     transfer_enabled = _env_flag("TRANSFER_TO_PROD", True)
     transfer_every_hours = _env_int("TRANSFER_EVERY_HOURS", 1)
+    reconcile_start_env = os.getenv("RECONCILE_START_DATE", "").strip()
+    reconcile_end_env = os.getenv("RECONCILE_END_DATE", "").strip()
+    reconcile_start = parse_ymd(reconcile_start_env) if reconcile_start_env else start_date
+    reconcile_end = parse_ymd(reconcile_end_env) if reconcile_end_env else end_date
+    reconcile_min_days = _env_int("RECONCILE_MIN_DAYS", 1)
+    reconcile_max_depth = _env_int("RECONCILE_MAX_DEPTH", 20)
 
     ch_admin = CH(host, port, user, password, "default")
     ensure_tables(ch_admin, db_test)
@@ -702,6 +806,30 @@ def main() -> None:
         except Exception:
             run_ok = False
             log.exception("BACKFILL: failed")
+
+    if reconcile_vri:
+        if not reconcile_start:
+            log.warning("RECONCILE: start date is empty -> skip")
+        elif not reconcile_end or reconcile_start > reconcile_end:
+            log.warning("RECONCILE: invalid date range -> skip")
+        else:
+            log.info("RECONCILE: start")
+            try:
+                reconcile_vri_range(
+                    ch_test,
+                    client,
+                    reconcile_start,
+                    reconcile_end,
+                    vri_rows,
+                    vri_sleep,
+                    skip_existing_vri,
+                    min_days=reconcile_min_days,
+                    max_depth=reconcile_max_depth,
+                )
+                log.info("RECONCILE: done")
+            except Exception:
+                run_ok = False
+                log.exception("RECONCILE: failed")
 
     if sync_mit:
         if mit_every_hours <= 0 or _should_run(ch_test, "mit_registry", timedelta(hours=mit_every_hours), now):

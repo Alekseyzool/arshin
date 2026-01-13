@@ -13,6 +13,7 @@ from dotenv import load_dotenv
 
 from fgis_clickhouse.clickhouse_io import CH, ensure_tables
 from fgis_clickhouse.fgis_api import FGISClient
+from fgis_clickhouse.utils import chunked
 
 
 load_dotenv()
@@ -116,17 +117,19 @@ def transfer_table(
     table: str,
     ts_col: str,
     state_key: str,
+    dedup: bool = False,
 ) -> int:
     last = _state_get(ch_dst, state_key)
     where = "1"
     if last:
         where = f"{ts_col} > toDateTime('{_format_dt(last)}')"
-    pending = int(ch_src.scalar(f"SELECT count() FROM {ch_src.db}.{table} WHERE {where}") or 0)
+    from_clause = f"{ch_src.db}.{table} FINAL" if dedup else f"{ch_src.db}.{table}"
+    pending = int(ch_src.scalar(f"SELECT count() FROM {from_clause} WHERE {where}") or 0)
     if pending == 0:
         log.info("TRANSFER %s: no new rows", table)
         return 0
-    ch_dst.exec(f"INSERT INTO {ch_dst.db}.{table} SELECT * FROM {ch_src.db}.{table} WHERE {where}")
-    max_src = ch_src.scalar(f"SELECT max({ts_col}) FROM {ch_src.db}.{table} WHERE {where}")
+    ch_dst.exec(f"INSERT INTO {ch_dst.db}.{table} SELECT * FROM {from_clause} WHERE {where}")
+    max_src = ch_src.scalar(f"SELECT max({ts_col}) FROM {from_clause} WHERE {where}")
     max_dt = parse_datetime_any(max_src) or datetime.now()
     _state_set(ch_dst, state_key, max_dt)
     log.info("TRANSFER %s: inserted %s", table, pending)
@@ -298,6 +301,83 @@ def remote_vri_count(client: FGISClient, fq: str) -> int:
         except Exception as exc:
             log.warning("remote_vri_count: vri_cursor fallback failed: %s", exc)
     raise RuntimeError("FGISClient has neither vri_count nor vri_cursor fallback.")
+
+
+def remote_vri_ids_for_day(
+    client: FGISClient,
+    d: date,
+    rows: int,
+    sleep_s: float,
+) -> set[str]:
+    fq = fq_for_day(d)
+    cursor_mark = "*"
+    ids: set[str] = set()
+    while True:
+        docs, _num_found, next_cursor = client.vri_cursor(fq=fq, rows=rows, cursor_mark=cursor_mark)
+        if not docs:
+            break
+        for doc in docs:
+            vri_id = doc.get("vri_id")
+            if vri_id:
+                ids.add(str(vri_id))
+        if not next_cursor or next_cursor == cursor_mark:
+            break
+        cursor_mark = next_cursor
+        if sleep_s > 0:
+            time.sleep(sleep_s)
+    return ids
+
+
+def local_vri_ids_for_day(ch: CH, d: date) -> set[str]:
+    ds = d.strftime("%Y-%m-%d")
+    sql = f"SELECT vri_id FROM {ch.db}.verifications WHERE verification_date = toDate('{ds}')"
+    try:
+        rows = ch.rows(sql)
+    except Exception:
+        return set()
+    return {row[0] for row in rows if row and row[0]}
+
+
+def optimize_verifications_partition(ch: CH, d: date) -> None:
+    partition = d.strftime("%Y%m")
+    ch.exec(f"OPTIMIZE TABLE {ch.db}.verifications PARTITION {partition} FINAL")
+
+
+def delete_vri_extras_for_day(
+    ch: CH,
+    client: FGISClient,
+    d: date,
+    rows: int,
+    sleep_s: float,
+    *,
+    max_remote: int,
+    optimize_partition: bool,
+    remote_rows: Optional[int] = None,
+) -> int:
+    if max_remote and remote_rows and remote_rows > max_remote:
+        log.warning("DELETE %s: remote rows=%s > max=%s -> skip", d, remote_rows, max_remote)
+        return 0
+    remote_ids = remote_vri_ids_for_day(client, d, rows, sleep_s)
+    if max_remote and len(remote_ids) > max_remote:
+        log.warning("DELETE %s: remote ids=%s > max=%s -> skip", d, len(remote_ids), max_remote)
+        return 0
+    local_ids = local_vri_ids_for_day(ch, d)
+    extra_ids = local_ids - remote_ids
+    if not extra_ids:
+        log.info("DELETE %s: no extra ids", d)
+        return 0
+    day_str = d.strftime("%Y-%m-%d")
+    log.warning("DELETE %s: removing %s extra ids", d, len(extra_ids))
+    for group in chunked(list(extra_ids), 1000):
+        ch.exec(
+            f"ALTER TABLE {ch.db}.verifications "
+            f"DELETE WHERE verification_date = toDate(%(day)s) AND vri_id IN %(ids)s "
+            f"SETTINGS mutations_sync=1",
+            {"day": day_str, "ids": tuple(group)},
+        )
+    if optimize_partition:
+        optimize_verifications_partition(ch, d)
+    return len(extra_ids)
 
 
 def _extract_manufacturer(details: dict[str, Any], list_doc: dict[str, Any]) -> tuple[str, Any]:
@@ -644,50 +724,185 @@ def reconcile_vri_range(
     sleep_s: float,
     skip_existing: bool,
     *,
+    delete_extra: bool,
+    delete_max_remote: int,
+    optimize_partitions: bool,
+    verify_after: bool,
     min_days: int,
     max_depth: int,
     depth: int = 0,
-) -> None:
+) -> bool:
     if start > end:
-        return
+        return True
     span = (end - start).days + 1
     fq = fq_for_range(start, end)
     remote_rows = remote_vri_count(client, fq)
-    if remote_rows == 0:
-        log.info("RECONCILE %s → %s: remote=0 -> skip", start, end)
-        return
     local_rows = local_vri_rows_range(ch, start, end)
+    if remote_rows == 0:
+        if local_rows == 0:
+            log.info("RECONCILE %s → %s: remote=0 local=0 -> skip", start, end)
+            return True
+        log.warning("RECONCILE %s → %s: remote=0 local=%s", start, end, local_rows)
+        if not delete_extra:
+            return False
+        if span <= max(1, min_days) or depth >= max_depth:
+            if span == 1:
+                delete_vri_extras_for_day(
+                    ch,
+                    client,
+                    start,
+                    rows,
+                    sleep_s,
+                    max_remote=delete_max_remote,
+                    optimize_partition=optimize_partitions,
+                    remote_rows=remote_rows,
+                )
+                return True if not verify_after else local_vri_rows_range(ch, start, end) == 0
+            cur = start
+            ok = True
+            while cur <= end:
+                ok = reconcile_vri_range(
+                    ch,
+                    client,
+                    cur,
+                    cur,
+                    rows,
+                    sleep_s,
+                    skip_existing,
+                    delete_extra=delete_extra,
+                    delete_max_remote=delete_max_remote,
+                    optimize_partitions=optimize_partitions,
+                    verify_after=verify_after,
+                    min_days=min_days,
+                    max_depth=max_depth,
+                    depth=depth + 1,
+                ) and ok
+                cur += timedelta(days=1)
+            return ok
+        mid = start + timedelta(days=(span - 1) // 2)
+        left_ok = reconcile_vri_range(
+            ch,
+            client,
+            start,
+            mid,
+            rows,
+            sleep_s,
+            skip_existing,
+            delete_extra=delete_extra,
+            delete_max_remote=delete_max_remote,
+            optimize_partitions=optimize_partitions,
+            verify_after=verify_after,
+            min_days=min_days,
+            max_depth=max_depth,
+            depth=depth + 1,
+        )
+        right_ok = reconcile_vri_range(
+            ch,
+            client,
+            mid + timedelta(days=1),
+            end,
+            rows,
+            sleep_s,
+            skip_existing,
+            delete_extra=delete_extra,
+            delete_max_remote=delete_max_remote,
+            optimize_partitions=optimize_partitions,
+            verify_after=verify_after,
+            min_days=min_days,
+            max_depth=max_depth,
+            depth=depth + 1,
+        )
+        return left_ok and right_ok
     if local_rows == remote_rows:
         log.info("RECONCILE %s → %s: OK (local=%s remote=%s)", start, end, local_rows, remote_rows)
-        return
-    if local_rows > remote_rows:
-        log.warning(
-            "RECONCILE %s → %s: local>%s remote=%s (skip, possible duplicates)",
-            start,
-            end,
-            local_rows,
-            remote_rows,
-        )
-        return
-    log.info(
-        "RECONCILE %s → %s: NEED SYNC (local=%s remote=%s delta=%s span=%s)",
-        start,
-        end,
-        local_rows,
-        remote_rows,
-        remote_rows - local_rows,
-        span,
-    )
+        return True
     if span <= max(1, min_days) or depth >= max_depth:
-        if span == 1:
-            log.info("RECONCILE %s: backfill day", start)
-            sync_vri_day(ch, client, start, rows, sleep_s, skip_existing, remote_total=remote_rows)
+        if local_rows < remote_rows:
+            log.info(
+                "RECONCILE %s → %s: NEED SYNC (local=%s remote=%s delta=%s span=%s)",
+                start,
+                end,
+                local_rows,
+                remote_rows,
+                remote_rows - local_rows,
+                span,
+            )
+            if span == 1:
+                log.info("RECONCILE %s: backfill day", start)
+                sync_vri_day(ch, client, start, rows, sleep_s, skip_existing, remote_total=remote_rows)
+            else:
+                log.info("RECONCILE %s → %s: backfill range", start, end)
+                sync_vri_range(ch, client, start, end, rows, sleep_s, skip_existing)
         else:
-            log.info("RECONCILE %s → %s: backfill range", start, end)
-            sync_vri_range(ch, client, start, end, rows, sleep_s, skip_existing)
-        return
+            log.warning(
+                "RECONCILE %s → %s: local>%s remote=%s delta=%s",
+                start,
+                end,
+                local_rows,
+                remote_rows,
+                local_rows - remote_rows,
+            )
+            if not delete_extra:
+                return False
+            if span == 1:
+                delete_vri_extras_for_day(
+                    ch,
+                    client,
+                    start,
+                    rows,
+                    sleep_s,
+                    max_remote=delete_max_remote,
+                    optimize_partition=optimize_partitions,
+                    remote_rows=remote_rows,
+                )
+            else:
+                cur = start
+                ok = True
+                while cur <= end:
+                    ok = reconcile_vri_range(
+                        ch,
+                        client,
+                        cur,
+                        cur,
+                        rows,
+                        sleep_s,
+                        skip_existing,
+                        delete_extra=delete_extra,
+                        delete_max_remote=delete_max_remote,
+                        optimize_partitions=optimize_partitions,
+                        verify_after=verify_after,
+                        min_days=min_days,
+                        max_depth=max_depth,
+                        depth=depth + 1,
+                    ) and ok
+                    cur += timedelta(days=1)
+                return ok
+        if verify_after:
+            local_after = local_vri_rows_range(ch, start, end)
+            if local_after > remote_rows and delete_extra and span == 1:
+                delete_vri_extras_for_day(
+                    ch,
+                    client,
+                    start,
+                    rows,
+                    sleep_s,
+                    max_remote=delete_max_remote,
+                    optimize_partition=optimize_partitions,
+                    remote_rows=remote_rows,
+                )
+                local_after = local_vri_rows_range(ch, start, end)
+            if local_after != remote_rows:
+                log.warning(
+                    "RECONCILE %s → %s: mismatch after fix (local=%s remote=%s)",
+                    start,
+                    end,
+                    local_after,
+                    remote_rows,
+                )
+                return False
+        return True
     mid = start + timedelta(days=(span - 1) // 2)
-    reconcile_vri_range(
+    left_ok = reconcile_vri_range(
         ch,
         client,
         start,
@@ -695,11 +910,15 @@ def reconcile_vri_range(
         rows,
         sleep_s,
         skip_existing,
+        delete_extra=delete_extra,
+        delete_max_remote=delete_max_remote,
+        optimize_partitions=optimize_partitions,
+        verify_after=verify_after,
         min_days=min_days,
         max_depth=max_depth,
         depth=depth + 1,
     )
-    reconcile_vri_range(
+    right_ok = reconcile_vri_range(
         ch,
         client,
         mid + timedelta(days=1),
@@ -707,10 +926,15 @@ def reconcile_vri_range(
         rows,
         sleep_s,
         skip_existing,
+        delete_extra=delete_extra,
+        delete_max_remote=delete_max_remote,
+        optimize_partitions=optimize_partitions,
+        verify_after=verify_after,
         min_days=min_days,
         max_depth=max_depth,
         depth=depth + 1,
     )
+    return left_ok and right_ok
 
 
 def sync_vri_scheduled(
@@ -787,6 +1011,11 @@ def main() -> None:
     reconcile_end = parse_ymd(reconcile_end_env) if reconcile_end_env else end_date
     reconcile_min_days = _env_int("RECONCILE_MIN_DAYS", 1)
     reconcile_max_depth = _env_int("RECONCILE_MAX_DEPTH", 20)
+    reconcile_delete_extra = _env_flag("RECONCILE_DELETE_EXTRA", False)
+    reconcile_delete_max_remote = _env_int("RECONCILE_DELETE_MAX_REMOTE", 0)
+    reconcile_optimize_final = _env_flag("RECONCILE_OPTIMIZE_FINAL", False)
+    reconcile_verify = _env_flag("RECONCILE_VERIFY", True)
+    transfer_dedup = _env_flag("TRANSFER_DEDUP", False)
 
     ch_admin = CH(host, port, user, password, "default")
     ensure_tables(ch_admin, db_test)
@@ -815,7 +1044,7 @@ def main() -> None:
         else:
             log.info("RECONCILE: start")
             try:
-                reconcile_vri_range(
+                reconcile_ok = reconcile_vri_range(
                     ch_test,
                     client,
                     reconcile_start,
@@ -823,10 +1052,17 @@ def main() -> None:
                     vri_rows,
                     vri_sleep,
                     skip_existing_vri,
+                    delete_extra=reconcile_delete_extra,
+                    delete_max_remote=reconcile_delete_max_remote,
+                    optimize_partitions=reconcile_optimize_final,
+                    verify_after=reconcile_verify,
                     min_days=reconcile_min_days,
                     max_depth=reconcile_max_depth,
                 )
                 log.info("RECONCILE: done")
+                if not reconcile_ok:
+                    run_ok = False
+                    log.warning("RECONCILE: mismatches remain -> transfer skipped")
             except Exception:
                 run_ok = False
                 log.exception("RECONCILE: failed")
@@ -872,8 +1108,22 @@ def main() -> None:
         else:
             log.info("TRANSFER: start")
             try:
-                transfer_table(ch_test, ch_prod, table="mit_registry", ts_col="inserted_at", state_key="transfer_mit")
-                transfer_table(ch_test, ch_prod, table="verifications", ts_col="inserted_at", state_key="transfer_vri")
+                transfer_table(
+                    ch_test,
+                    ch_prod,
+                    table="mit_registry",
+                    ts_col="inserted_at",
+                    state_key="transfer_mit",
+                    dedup=transfer_dedup,
+                )
+                transfer_table(
+                    ch_test,
+                    ch_prod,
+                    table="verifications",
+                    ts_col="inserted_at",
+                    state_key="transfer_vri",
+                    dedup=transfer_dedup,
+                )
                 _state_set(ch_prod, "transfer_prod", datetime.now())
                 log.info("TRANSFER: done")
             except Exception:

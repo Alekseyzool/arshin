@@ -34,8 +34,10 @@ class CH:
             pass
         self._connect()
 
-    def exec(self, sql: str) -> Any:
-        return self._client.execute(sql)
+    def exec(self, sql: str, params: Optional[dict] = None) -> Any:
+        if params is None:
+            return self._client.execute(sql)
+        return self._client.execute(sql, params)
 
     def scalar(self, sql: str) -> Any:
         rows = self._client.execute(sql)

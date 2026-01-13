@@ -136,6 +136,79 @@ def transfer_table(
     return pending
 
 
+def promote_vri_range(
+    ch_src: CH,
+    ch_dst: CH,
+    start: date,
+    end: date,
+    *,
+    dedup: bool,
+    delete_before_insert: bool,
+    verify: bool,
+    dry_run: bool,
+    max_rows: int,
+) -> bool:
+    cur = start
+    ok = True
+    from_clause = f"{ch_src.db}.verifications FINAL" if dedup else f"{ch_src.db}.verifications"
+    while cur <= end:
+        test_rows = local_vri_rows_range(ch_src, cur, cur, use_final=dedup)
+        prod_rows_final = local_vri_rows_range(ch_dst, cur, cur, use_final=dedup)
+        prod_rows_raw = (
+            local_vri_rows_range(ch_dst, cur, cur, use_final=False) if dedup else prod_rows_final
+        )
+        needs_sync = test_rows != prod_rows_final or (dedup and prod_rows_raw != prod_rows_final)
+        if not needs_sync:
+            cur += timedelta(days=1)
+            continue
+        if max_rows and test_rows > max_rows:
+            log.warning("PROMOTE %s: test_rows=%s > max=%s -> skip", cur, test_rows, max_rows)
+            ok = False
+            cur += timedelta(days=1)
+            continue
+        log.info(
+            "PROMOTE %s: test=%s prod_raw=%s prod_final=%s -> sync",
+            cur,
+            test_rows,
+            prod_rows_raw,
+            prod_rows_final,
+        )
+        if dry_run:
+            cur += timedelta(days=1)
+            continue
+        day_str = cur.strftime("%Y-%m-%d")
+        if delete_before_insert:
+            ch_dst.exec(
+                f"ALTER TABLE {ch_dst.db}.verifications "
+                f"DELETE WHERE verification_date = toDate(%(day)s) "
+                f"SETTINGS mutations_sync=1",
+                {"day": day_str},
+            )
+        if test_rows > 0:
+            ch_dst.exec(
+                f"INSERT INTO {ch_dst.db}.verifications "
+                f"SELECT * FROM {from_clause} "
+                f"WHERE verification_date = toDate(%(day)s)",
+                {"day": day_str},
+            )
+        if verify:
+            prod_after = local_vri_rows_range(ch_dst, cur, cur, use_final=dedup)
+            prod_after_raw = (
+                local_vri_rows_range(ch_dst, cur, cur, use_final=False) if dedup else prod_after
+            )
+            if prod_after != test_rows or (dedup and prod_after_raw != prod_after):
+                log.warning(
+                    "PROMOTE %s: mismatch after sync (test=%s prod_final=%s prod_raw=%s)",
+                    cur,
+                    test_rows,
+                    prod_after,
+                    prod_after_raw,
+                )
+                ok = False
+        cur += timedelta(days=1)
+    return ok
+
+
 def _should_run(ch: CH, key: str, every: timedelta, now: datetime) -> bool:
     last = _state_get(ch, key)
     if not last:
@@ -275,11 +348,12 @@ def local_vri_stats(ch: CH, d: date) -> tuple[int, int]:
     return 0, 0
 
 
-def local_vri_rows_range(ch: CH, start: date, end: date) -> int:
+def local_vri_rows_range(ch: CH, start: date, end: date, *, use_final: bool = False) -> int:
     start_s = start.strftime("%Y-%m-%d")
     end_s = end.strftime("%Y-%m-%d")
+    from_clause = f"{ch.db}.verifications FINAL" if use_final else f"{ch.db}.verifications"
     sql = (
-        f"SELECT count() FROM {ch.db}.verifications "
+        f"SELECT count() FROM {from_clause} "
         f"WHERE verification_date >= toDate('{start_s}') AND verification_date <= toDate('{end_s}')"
     )
     try:
@@ -341,6 +415,23 @@ def local_vri_ids_for_day(ch: CH, d: date) -> set[str]:
 def optimize_verifications_partition(ch: CH, d: date) -> None:
     partition = d.strftime("%Y%m")
     ch.exec(f"OPTIMIZE TABLE {ch.db}.verifications PARTITION {partition} FINAL")
+
+
+def iter_month_starts(start: date, end: date) -> Iterable[date]:
+    cur = date(start.year, start.month, 1)
+    last = date(end.year, end.month, 1)
+    while cur <= last:
+        yield cur
+        if cur.month == 12:
+            cur = date(cur.year + 1, 1, 1)
+        else:
+            cur = date(cur.year, cur.month + 1, 1)
+
+
+def optimize_verifications_range(ch: CH, start: date, end: date) -> None:
+    for month_start in iter_month_starts(start, end):
+        log.info("DEDUP %s: optimize partition", month_start.strftime("%Y-%m"))
+        optimize_verifications_partition(ch, month_start)
 
 
 def delete_vri_extras_for_day(
@@ -728,6 +819,7 @@ def reconcile_vri_range(
     delete_max_remote: int,
     optimize_partitions: bool,
     verify_after: bool,
+    use_final: bool,
     min_days: int,
     max_depth: int,
     depth: int = 0,
@@ -737,7 +829,7 @@ def reconcile_vri_range(
     span = (end - start).days + 1
     fq = fq_for_range(start, end)
     remote_rows = remote_vri_count(client, fq)
-    local_rows = local_vri_rows_range(ch, start, end)
+    local_rows = local_vri_rows_range(ch, start, end, use_final=use_final)
     if remote_rows == 0:
         if local_rows == 0:
             log.info("RECONCILE %s → %s: remote=0 local=0 -> skip", start, end)
@@ -757,7 +849,7 @@ def reconcile_vri_range(
                     optimize_partition=optimize_partitions,
                     remote_rows=remote_rows,
                 )
-                return True if not verify_after else local_vri_rows_range(ch, start, end) == 0
+                return True if not verify_after else local_vri_rows_range(ch, start, end, use_final=use_final) == 0
             cur = start
             ok = True
             while cur <= end:
@@ -773,6 +865,7 @@ def reconcile_vri_range(
                     delete_max_remote=delete_max_remote,
                     optimize_partitions=optimize_partitions,
                     verify_after=verify_after,
+                    use_final=use_final,
                     min_days=min_days,
                     max_depth=max_depth,
                     depth=depth + 1,
@@ -792,6 +885,7 @@ def reconcile_vri_range(
             delete_max_remote=delete_max_remote,
             optimize_partitions=optimize_partitions,
             verify_after=verify_after,
+            use_final=use_final,
             min_days=min_days,
             max_depth=max_depth,
             depth=depth + 1,
@@ -808,6 +902,7 @@ def reconcile_vri_range(
             delete_max_remote=delete_max_remote,
             optimize_partitions=optimize_partitions,
             verify_after=verify_after,
+            use_final=use_final,
             min_days=min_days,
             max_depth=max_depth,
             depth=depth + 1,
@@ -871,6 +966,7 @@ def reconcile_vri_range(
                         delete_max_remote=delete_max_remote,
                         optimize_partitions=optimize_partitions,
                         verify_after=verify_after,
+                        use_final=use_final,
                         min_days=min_days,
                         max_depth=max_depth,
                         depth=depth + 1,
@@ -878,7 +974,7 @@ def reconcile_vri_range(
                     cur += timedelta(days=1)
                 return ok
         if verify_after:
-            local_after = local_vri_rows_range(ch, start, end)
+            local_after = local_vri_rows_range(ch, start, end, use_final=use_final)
             if local_after > remote_rows and delete_extra and span == 1:
                 delete_vri_extras_for_day(
                     ch,
@@ -890,7 +986,7 @@ def reconcile_vri_range(
                     optimize_partition=optimize_partitions,
                     remote_rows=remote_rows,
                 )
-                local_after = local_vri_rows_range(ch, start, end)
+                local_after = local_vri_rows_range(ch, start, end, use_final=use_final)
             if local_after != remote_rows:
                 log.warning(
                     "RECONCILE %s → %s: mismatch after fix (local=%s remote=%s)",
@@ -914,6 +1010,7 @@ def reconcile_vri_range(
         delete_max_remote=delete_max_remote,
         optimize_partitions=optimize_partitions,
         verify_after=verify_after,
+        use_final=use_final,
         min_days=min_days,
         max_depth=max_depth,
         depth=depth + 1,
@@ -930,6 +1027,7 @@ def reconcile_vri_range(
         delete_max_remote=delete_max_remote,
         optimize_partitions=optimize_partitions,
         verify_after=verify_after,
+        use_final=use_final,
         min_days=min_days,
         max_depth=max_depth,
         depth=depth + 1,
@@ -1005,6 +1103,7 @@ def main() -> None:
     mit_every_hours = _env_int("MIT_EVERY_HOURS", 3)
     transfer_enabled = _env_flag("TRANSFER_TO_PROD", True)
     transfer_every_hours = _env_int("TRANSFER_EVERY_HOURS", 1)
+    transfer_force = _env_flag("TRANSFER_FORCE", False)
     reconcile_start_env = os.getenv("RECONCILE_START_DATE", "").strip()
     reconcile_end_env = os.getenv("RECONCILE_END_DATE", "").strip()
     reconcile_start = parse_ymd(reconcile_start_env) if reconcile_start_env else start_date
@@ -1015,7 +1114,23 @@ def main() -> None:
     reconcile_delete_max_remote = _env_int("RECONCILE_DELETE_MAX_REMOTE", 0)
     reconcile_optimize_final = _env_flag("RECONCILE_OPTIMIZE_FINAL", False)
     reconcile_verify = _env_flag("RECONCILE_VERIFY", True)
+    reconcile_use_final = _env_flag("RECONCILE_USE_FINAL", False)
+    reconcile_dedup_final = _env_flag("RECONCILE_DEDUP_FINAL", False)
     transfer_dedup = _env_flag("TRANSFER_DEDUP", False)
+    promote_vri = _env_flag("PROMOTE_VRI", False)
+    promote_start_env = os.getenv("PROMOTE_START_DATE", "").strip()
+    promote_end_env = os.getenv("PROMOTE_END_DATE", "").strip()
+    promote_start = parse_ymd(promote_start_env) if promote_start_env else None
+    promote_end = parse_ymd(promote_end_env) if promote_end_env else None
+    promote_dedup = _env_flag("PROMOTE_DEDUP", True)
+    promote_delete = _env_flag("PROMOTE_DELETE", True)
+    promote_verify = _env_flag("PROMOTE_VERIFY", True)
+    promote_dry_run = _env_flag("PROMOTE_DRY_RUN", False)
+    promote_max_rows = _env_int("PROMOTE_MAX_ROWS", 0)
+    if not promote_start:
+        promote_start = reconcile_start or start_date
+    if not promote_end:
+        promote_end = reconcile_end or end_date
 
     ch_admin = CH(host, port, user, password, "default")
     ensure_tables(ch_admin, db_test)
@@ -1027,6 +1142,7 @@ def main() -> None:
 
     now = datetime.now()
     run_ok = True
+    reconcile_ok = True
 
     if backfill_list:
         log.info("BACKFILL: %s dates", len(backfill_list))
@@ -1056,10 +1172,14 @@ def main() -> None:
                     delete_max_remote=reconcile_delete_max_remote,
                     optimize_partitions=reconcile_optimize_final,
                     verify_after=reconcile_verify,
+                    use_final=reconcile_use_final,
                     min_days=reconcile_min_days,
                     max_depth=reconcile_max_depth,
                 )
                 log.info("RECONCILE: done")
+                if reconcile_ok and reconcile_dedup_final:
+                    log.info("DEDUP: optimize partitions in range")
+                    optimize_verifications_range(ch_test, reconcile_start, reconcile_end)
                 if not reconcile_ok:
                     run_ok = False
                     log.warning("RECONCILE: mismatches remain -> transfer skipped")
@@ -1099,9 +1219,9 @@ def main() -> None:
             log.exception("VRI sync (test): failed")
 
     if transfer_enabled:
-        if transfer_every_hours <= 0:
+        if transfer_every_hours <= 0 and not transfer_force:
             log.info("TRANSFER: disabled by schedule")
-        elif not _should_run(ch_prod, "transfer_prod", timedelta(hours=transfer_every_hours), now):
+        elif not transfer_force and not _should_run(ch_prod, "transfer_prod", timedelta(hours=transfer_every_hours), now):
             log.info("TRANSFER: skipped by schedule")
         elif not run_ok:
             log.warning("TRANSFER: skipped because test sync failed")
@@ -1116,14 +1236,42 @@ def main() -> None:
                     state_key="transfer_mit",
                     dedup=transfer_dedup,
                 )
-                transfer_table(
-                    ch_test,
-                    ch_prod,
-                    table="verifications",
-                    ts_col="inserted_at",
-                    state_key="transfer_vri",
-                    dedup=transfer_dedup,
-                )
+                if promote_vri:
+                    if not reconcile_vri:
+                        log.warning("PROMOTE: reconcile disabled -> skip")
+                        run_ok = False
+                    elif not reconcile_ok:
+                        log.warning("PROMOTE: skipped because reconcile not OK")
+                        run_ok = False
+                    elif not promote_start or not promote_end or promote_start > promote_end:
+                        log.warning("PROMOTE: invalid date range -> skip")
+                        run_ok = False
+                    else:
+                        promote_ok = promote_vri_range(
+                            ch_test,
+                            ch_prod,
+                            promote_start,
+                            promote_end,
+                            dedup=promote_dedup,
+                            delete_before_insert=promote_delete,
+                            verify=promote_verify,
+                            dry_run=promote_dry_run,
+                            max_rows=promote_max_rows,
+                        )
+                        if not promote_ok:
+                            run_ok = False
+                            log.warning("PROMOTE: mismatches remain")
+                        elif not promote_dry_run:
+                            _state_set(ch_prod, "transfer_vri", datetime.now())
+                else:
+                    transfer_table(
+                        ch_test,
+                        ch_prod,
+                        table="verifications",
+                        ts_col="inserted_at",
+                        state_key="transfer_vri",
+                        dedup=transfer_dedup,
+                    )
                 _state_set(ch_prod, "transfer_prod", datetime.now())
                 log.info("TRANSFER: done")
             except Exception:

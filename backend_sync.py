@@ -7,7 +7,7 @@ import logging
 import os
 import time
 from datetime import date, datetime, timedelta
-from typing import Any, Optional
+from typing import Any, Optional, Iterable
 
 from dotenv import load_dotenv
 
@@ -251,13 +251,34 @@ def pick_start_date(ch: CH, start_date: Optional[date], tail_days: int) -> Optio
     return start_date
 
 
-def local_vri_count(ch: CH, d: date) -> int:
+def local_vri_stats(ch: CH, d: date) -> tuple[int, int]:
     ds = d.strftime("%Y-%m-%d")
-    sql = f"SELECT countDistinct(vri_id) FROM {ch.db}.verifications WHERE verification_date = toDate('{ds}')"
+    sql = (
+        f"SELECT count(), countDistinct(vri_id) FROM {ch.db}.verifications "
+        f"WHERE verification_date = toDate('{ds}')"
+    )
     try:
-        return int(ch.scalar(sql) or 0)
+        rows = ch.rows(sql)
+        if rows:
+            return int(rows[0][0] or 0), int(rows[0][1] or 0)
     except Exception:
-        return 0
+        return 0, 0
+    return 0, 0
+
+
+def remote_vri_count(client: FGISClient, fq: str) -> int:
+    if hasattr(client, "vri_count"):
+        try:
+            return int(client.vri_count(fq) or 0)
+        except Exception as exc:
+            log.warning("remote_vri_count: vri_count failed: %s", exc)
+    if hasattr(client, "vri_cursor"):
+        try:
+            _docs, num_found, _next = client.vri_cursor(fq=fq, rows=0, cursor_mark="*")
+            return int(num_found or 0)
+        except Exception as exc:
+            log.warning("remote_vri_count: vri_cursor fallback failed: %s", exc)
+    raise RuntimeError("FGISClient has neither vri_count nor vri_cursor fallback.")
 
 
 def _extract_manufacturer(details: dict[str, Any], list_doc: dict[str, Any]) -> tuple[str, Any]:
@@ -486,6 +507,7 @@ def sync_vri_day(
     rows: int,
     sleep_s: float,
     skip_existing: bool,
+    remote_total: Optional[int] = None,
 ) -> int:
     cursor_mark = "*"
     total = 0
@@ -494,6 +516,8 @@ def sync_vri_day(
         docs, num_found, next_cursor = client.vri_cursor(fq=fq, rows=rows, cursor_mark=cursor_mark)
         if not docs:
             break
+        if remote_total is None:
+            remote_total = num_found
         docs_to_insert = docs
         if skip_existing:
             ids = [doc.get("vri_id") for doc in docs if doc.get("vri_id")]
@@ -509,7 +533,13 @@ def sync_vri_day(
         if rows_to_insert:
             insert_verifications(ch, rows_to_insert)
             total += len(rows_to_insert)
-        log.info("%s: +%s (total=%s/%s)", d, len(rows_to_insert), total, num_found)
+        log.info(
+            "%s: +%s (loaded=%s / remote=%s)",
+            d,
+            len(rows_to_insert),
+            total,
+            remote_total if remote_total is not None else num_found,
+        )
         if not next_cursor or next_cursor == cursor_mark:
             break
         cursor_mark = next_cursor
@@ -529,18 +559,61 @@ def sync_vri_range(
 ) -> None:
     cur = start
     while cur <= end:
-        remote_cnt = client.vri_count(fq_for_day(cur))
-        if remote_cnt == 0:
+        fq = fq_for_day(cur)
+        remote_rows = remote_vri_count(client, fq)
+        if remote_rows == 0:
             cur += timedelta(days=1)
             continue
-        local_cnt = local_vri_count(ch, cur)
-        if local_cnt >= remote_cnt:
+        local_rows, local_uniq = local_vri_stats(ch, cur)
+        local_dup = local_rows - local_uniq
+        if local_rows >= remote_rows:
+            log.info(
+                "VRI %s: OK (local_rows=%s remote_rows=%s uniq=%s dup=%s) -> skip",
+                cur,
+                local_rows,
+                remote_rows,
+                local_uniq,
+                local_dup,
+            )
             cur += timedelta(days=1)
             continue
-        log.info("VRI %s: local=%s remote=%s -> sync", cur, local_cnt, remote_cnt)
-        loaded = sync_vri_day(ch, client, cur, rows, sleep_s, skip_existing)
+        log.info(
+            "VRI %s: NEED SYNC (local_rows=%s remote_rows=%s uniq=%s dup=%s)",
+            cur,
+            local_rows,
+            remote_rows,
+            local_uniq,
+            local_dup,
+        )
+        loaded = sync_vri_day(ch, client, cur, rows, sleep_s, skip_existing, remote_total=remote_rows)
         log.info("VRI %s: loaded=%s", cur, loaded)
         cur += timedelta(days=1)
+
+
+def parse_backfill_dates(env_value: str) -> list[date]:
+    env_value = (env_value or "").strip()
+    if not env_value:
+        return []
+    out: list[date] = []
+    for part in env_value.split(","):
+        parsed = parse_ymd(part.strip())
+        if parsed:
+            out.append(parsed)
+    return sorted(set(out))
+
+
+def backfill_dates(
+    ch: CH,
+    client: FGISClient,
+    dates: Iterable[date],
+    rows: int,
+    sleep_s: float,
+    skip_existing: bool,
+) -> None:
+    for d in dates:
+        log.info("BACKFILL %s: start", d)
+        sync_vri_range(ch, client, d, d, rows, sleep_s, skip_existing)
+        log.info("BACKFILL %s: done", d)
 
 
 def sync_vri_scheduled(
@@ -598,6 +671,8 @@ def main() -> None:
     end_date = parse_ymd(end_date_env) if end_date_env else date.today()
     if end_date is None:
         end_date = date.today()
+    backfill_env = os.getenv("BACKFILL_DATES", "")
+    backfill_list = parse_backfill_dates(backfill_env)
 
     sync_mit = _env_flag("SYNC_MIT", True)
     sync_vri = _env_flag("SYNC_VRI", True)
@@ -619,6 +694,14 @@ def main() -> None:
 
     now = datetime.now()
     run_ok = True
+
+    if backfill_list:
+        log.info("BACKFILL: %s dates", len(backfill_list))
+        try:
+            backfill_dates(ch_test, client, backfill_list, vri_rows, vri_sleep, skip_existing_vri)
+        except Exception:
+            run_ok = False
+            log.exception("BACKFILL: failed")
 
     if sync_mit:
         if mit_every_hours <= 0 or _should_run(ch_test, "mit_registry", timedelta(hours=mit_every_hours), now):

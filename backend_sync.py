@@ -142,17 +142,36 @@ def promote_vri_range(
     start: date,
     end: date,
     *,
+    client: Optional[FGISClient] = None,
     dedup: bool,
     delete_before_insert: bool,
     verify: bool,
     dry_run: bool,
     max_rows: int,
+    require_remote_match: bool = False,
 ) -> bool:
     cur = start
     ok = True
     from_clause = f"{ch_src.db}.verifications FINAL" if dedup else f"{ch_src.db}.verifications"
     while cur <= end:
         test_rows = local_vri_rows_range(ch_src, cur, cur, use_final=dedup)
+        if require_remote_match:
+            if client is None:
+                log.warning("PROMOTE %s: remote check requested but no client -> skip", cur)
+                ok = False
+                cur += timedelta(days=1)
+                continue
+            remote_rows = remote_vri_count(client, fq_for_day(cur))
+            if test_rows != remote_rows:
+                log.warning(
+                    "PROMOTE %s: test_rows=%s != remote=%s -> skip",
+                    cur,
+                    test_rows,
+                    remote_rows,
+                )
+                ok = False
+                cur += timedelta(days=1)
+                continue
         prod_rows_final = local_vri_rows_range(ch_dst, cur, cur, use_final=dedup)
         prod_rows_raw = (
             local_vri_rows_range(ch_dst, cur, cur, use_final=False) if dedup else prod_rows_final
@@ -1127,6 +1146,8 @@ def main() -> None:
     promote_verify = _env_flag("PROMOTE_VERIFY", True)
     promote_dry_run = _env_flag("PROMOTE_DRY_RUN", False)
     promote_max_rows = _env_int("PROMOTE_MAX_ROWS", 0)
+    promote_require_remote = _env_flag("PROMOTE_REQUIRE_REMOTE_MATCH", False)
+    promote_allow_partial = _env_flag("PROMOTE_ALLOW_PARTIAL", False)
     if not promote_start:
         promote_start = reconcile_start or start_date
     if not promote_end:
@@ -1240,23 +1261,27 @@ def main() -> None:
                     if not reconcile_vri:
                         log.warning("PROMOTE: reconcile disabled -> skip")
                         run_ok = False
-                    elif not reconcile_ok:
+                    elif not reconcile_ok and not promote_allow_partial:
                         log.warning("PROMOTE: skipped because reconcile not OK")
                         run_ok = False
                     elif not promote_start or not promote_end or promote_start > promote_end:
                         log.warning("PROMOTE: invalid date range -> skip")
                         run_ok = False
                     else:
+                        if not reconcile_ok and promote_allow_partial:
+                            log.warning("PROMOTE: reconcile not OK -> promoting only matching days")
                         promote_ok = promote_vri_range(
                             ch_test,
                             ch_prod,
                             promote_start,
                             promote_end,
+                            client=client if promote_require_remote else None,
                             dedup=promote_dedup,
                             delete_before_insert=promote_delete,
                             verify=promote_verify,
                             dry_run=promote_dry_run,
                             max_rows=promote_max_rows,
+                            require_remote_match=promote_require_remote,
                         )
                         if not promote_ok:
                             run_ok = False

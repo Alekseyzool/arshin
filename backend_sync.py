@@ -21,6 +21,13 @@ load_dotenv()
 logging.basicConfig(format="%(asctime)s - %(levelname)s - %(message)s", level=logging.INFO)
 log = logging.getLogger("fgis_backend")
 
+DEFAULT_START_DATE = date(2020, 1, 1)
+DEFAULT_VRI_ROWS = 9999
+DEFAULT_VRI_SLEEP = 0.0
+SIMPLE_RECENT_DAYS = 14
+SIMPLE_REMOTE_FULL_EVERY_HOURS = 24
+SIMPLE_PROD_SYNC_EVERY_HOURS = 4
+
 
 def _env_flag(name: str, default: bool = True) -> bool:
     value = os.getenv(name)
@@ -355,7 +362,7 @@ def pick_start_date(ch: CH, start_date: Optional[date], tail_days: int) -> Optio
 def local_vri_stats(ch: CH, d: date) -> tuple[int, int]:
     ds = d.strftime("%Y-%m-%d")
     sql = (
-        f"SELECT count(), countDistinct(vri_id) FROM {ch.db}.verifications "
+        f"SELECT count(), uniqExact(vri_id) FROM {ch.db}.verifications "
         f"WHERE verification_date = toDate('{ds}')"
     )
     try:
@@ -379,6 +386,22 @@ def local_vri_rows_range(ch: CH, start: date, end: date, *, use_final: bool = Fa
         return int(ch.scalar(sql) or 0)
     except Exception:
         return 0
+
+
+def local_vri_counts_range(ch: CH, start: date, end: date) -> tuple[int, int]:
+    start_s = start.strftime("%Y-%m-%d")
+    end_s = end.strftime("%Y-%m-%d")
+    sql = (
+        f"SELECT count(), uniqExact(vri_id) FROM {ch.db}.verifications "
+        f"WHERE verification_date >= toDate('{start_s}') AND verification_date <= toDate('{end_s}')"
+    )
+    try:
+        rows = ch.rows(sql)
+        if rows:
+            return int(rows[0][0] or 0), int(rows[0][1] or 0)
+    except Exception:
+        return 0, 0
+    return 0, 0
 
 
 def remote_vri_count(client: FGISClient, fq: str) -> int:
@@ -447,6 +470,27 @@ def iter_month_starts(start: date, end: date) -> Iterable[date]:
             cur = date(cur.year, cur.month + 1, 1)
 
 
+def iter_year_ranges(start: date, end: date) -> Iterable[tuple[date, date]]:
+    for year in range(start.year, end.year + 1):
+        year_start = date(year, 1, 1)
+        year_end = date(year, 12, 31)
+        yield max(start, year_start), min(end, year_end)
+
+
+def iter_month_ranges(start: date, end: date) -> Iterable[tuple[date, date]]:
+    for month_start in iter_month_starts(start, end):
+        next_month = (month_start.replace(day=28) + timedelta(days=4)).replace(day=1)
+        month_end = next_month - timedelta(days=1)
+        yield max(start, month_start), min(end, month_end)
+
+
+def iter_days(start: date, end: date) -> Iterable[date]:
+    cur = start
+    while cur <= end:
+        yield cur
+        cur += timedelta(days=1)
+
+
 def optimize_verifications_range(ch: CH, start: date, end: date) -> None:
     for month_start in iter_month_starts(start, end):
         log.info("DEDUP %s: optimize partition", month_start.strftime("%Y-%m"))
@@ -488,6 +532,257 @@ def delete_vri_extras_for_day(
     if optimize_partition:
         optimize_verifications_partition(ch, d)
     return len(extra_ids)
+
+
+def delete_vri_day(ch: CH, d: date) -> None:
+    day_str = d.strftime("%Y-%m-%d")
+    ch.exec(
+        f"ALTER TABLE {ch.db}.verifications "
+        f"DELETE WHERE verification_date = toDate(%(day)s) "
+        f"SETTINGS mutations_sync=1",
+        {"day": day_str},
+    )
+
+
+def reload_vri_day_from_remote(
+    ch: CH,
+    client: FGISClient,
+    d: date,
+    rows: int,
+    sleep_s: float,
+) -> bool:
+    remote_rows = remote_vri_count(client, fq_for_day(d))
+    delete_vri_day(ch, d)
+    if remote_rows > 0:
+        sync_vri_day(ch, client, d, rows, sleep_s, skip_existing=False, remote_total=remote_rows)
+    local_rows, local_uniq = local_vri_stats(ch, d)
+    if local_rows == local_uniq == remote_rows:
+        log.info("REMOTE %s: OK (rows=%s uniq=%s remote=%s)", d, local_rows, local_uniq, remote_rows)
+        return True
+    log.warning(
+        "REMOTE %s: mismatch after reload (rows=%s uniq=%s remote=%s)",
+        d,
+        local_rows,
+        local_uniq,
+        remote_rows,
+    )
+    return False
+
+
+def reconcile_day_with_remote(
+    ch: CH,
+    client: FGISClient,
+    d: date,
+    rows: int,
+    sleep_s: float,
+) -> bool:
+    remote_rows = remote_vri_count(client, fq_for_day(d))
+    local_rows, local_uniq = local_vri_stats(ch, d)
+    if local_rows == local_uniq == remote_rows:
+        log.info("REMOTE %s: OK (rows=%s uniq=%s remote=%s)", d, local_rows, local_uniq, remote_rows)
+        return True
+    log.warning(
+        "REMOTE %s: reload (rows=%s uniq=%s remote=%s)",
+        d,
+        local_rows,
+        local_uniq,
+        remote_rows,
+    )
+    return reload_vri_day_from_remote(ch, client, d, rows, sleep_s)
+
+
+def reconcile_remote_by_year_month(
+    ch: CH,
+    client: FGISClient,
+    start: date,
+    end: date,
+    rows: int,
+    sleep_s: float,
+) -> bool:
+    ok = True
+    for year_start, year_end in iter_year_ranges(start, end):
+        remote_rows = remote_vri_count(client, fq_for_range(year_start, year_end))
+        local_rows, local_uniq = local_vri_counts_range(ch, year_start, year_end)
+        if local_rows == local_uniq == remote_rows:
+            log.info(
+                "REMOTE YEAR %s: OK (rows=%s uniq=%s remote=%s)",
+                year_start.year,
+                local_rows,
+                local_uniq,
+                remote_rows,
+            )
+            continue
+        log.warning(
+            "REMOTE YEAR %s: mismatch (rows=%s uniq=%s remote=%s)",
+            year_start.year,
+            local_rows,
+            local_uniq,
+            remote_rows,
+        )
+        for month_start, month_end in iter_month_ranges(year_start, year_end):
+            remote_rows = remote_vri_count(client, fq_for_range(month_start, month_end))
+            local_rows, local_uniq = local_vri_counts_range(ch, month_start, month_end)
+            label = month_start.strftime("%Y-%m")
+            if local_rows == local_uniq == remote_rows:
+                log.info(
+                    "REMOTE MONTH %s: OK (rows=%s uniq=%s remote=%s)",
+                    label,
+                    local_rows,
+                    local_uniq,
+                    remote_rows,
+                )
+                continue
+            log.warning(
+                "REMOTE MONTH %s: mismatch (rows=%s uniq=%s remote=%s)",
+                label,
+                local_rows,
+                local_uniq,
+                remote_rows,
+            )
+            for day in iter_days(month_start, month_end):
+                ok = reconcile_day_with_remote(ch, client, day, rows, sleep_s) and ok
+    return ok
+
+
+def replace_vri_day_from_test(ch_src: CH, ch_dst: CH, d: date, *, dedup: bool) -> None:
+    delete_vri_day(ch_dst, d)
+    from_clause = f"{ch_src.db}.verifications FINAL" if dedup else f"{ch_src.db}.verifications"
+    day_str = d.strftime("%Y-%m-%d")
+    ch_dst.exec(
+        f"INSERT INTO {ch_dst.db}.verifications "
+        f"SELECT * FROM {from_clause} "
+        f"WHERE verification_date = toDate(%(day)s)",
+        {"day": day_str},
+    )
+
+
+def reconcile_day_with_test(ch_test: CH, ch_prod: CH, d: date, *, dedup: bool) -> bool:
+    test_rows, test_uniq = local_vri_stats(ch_test, d)
+    prod_rows, prod_uniq = local_vri_stats(ch_prod, d)
+    if test_rows == test_uniq and prod_rows == prod_uniq and test_uniq == prod_uniq:
+        log.info(
+            "PROD %s: OK (test=%s prod=%s)",
+            d,
+            test_uniq,
+            prod_uniq,
+        )
+        return True
+    log.warning(
+        "PROD %s: reload (test_rows=%s test_uniq=%s prod_rows=%s prod_uniq=%s)",
+        d,
+        test_rows,
+        test_uniq,
+        prod_rows,
+        prod_uniq,
+    )
+    if test_uniq == 0:
+        delete_vri_day(ch_prod, d)
+    else:
+        replace_vri_day_from_test(ch_test, ch_prod, d, dedup=dedup)
+    prod_rows, prod_uniq = local_vri_stats(ch_prod, d)
+    if prod_rows == prod_uniq == test_uniq:
+        log.info("PROD %s: OK after reload (rows=%s uniq=%s)", d, prod_rows, prod_uniq)
+        return True
+    log.warning(
+        "PROD %s: mismatch after reload (rows=%s uniq=%s test=%s)",
+        d,
+        prod_rows,
+        prod_uniq,
+        test_uniq,
+    )
+    return False
+
+
+def reconcile_prod_by_year_month(
+    ch_test: CH,
+    ch_prod: CH,
+    start: date,
+    end: date,
+    *,
+    dedup: bool,
+) -> bool:
+    ok = True
+    for year_start, year_end in iter_year_ranges(start, end):
+        test_rows, test_uniq = local_vri_counts_range(ch_test, year_start, year_end)
+        prod_rows, prod_uniq = local_vri_counts_range(ch_prod, year_start, year_end)
+        if (
+            test_rows == test_uniq
+            and prod_rows == prod_uniq
+            and test_uniq == prod_uniq
+        ):
+            log.info(
+                "PROD YEAR %s: OK (test=%s prod=%s)",
+                year_start.year,
+                test_uniq,
+                prod_uniq,
+            )
+            continue
+        log.warning(
+            "PROD YEAR %s: mismatch (test_rows=%s test_uniq=%s prod_rows=%s prod_uniq=%s)",
+            year_start.year,
+            test_rows,
+            test_uniq,
+            prod_rows,
+            prod_uniq,
+        )
+        for month_start, month_end in iter_month_ranges(year_start, year_end):
+            test_rows, test_uniq = local_vri_counts_range(ch_test, month_start, month_end)
+            prod_rows, prod_uniq = local_vri_counts_range(ch_prod, month_start, month_end)
+            label = month_start.strftime("%Y-%m")
+            if (
+                test_rows == test_uniq
+                and prod_rows == prod_uniq
+                and test_uniq == prod_uniq
+            ):
+                log.info(
+                    "PROD MONTH %s: OK (test=%s prod=%s)",
+                    label,
+                    test_uniq,
+                    prod_uniq,
+                )
+                continue
+            log.warning(
+                "PROD MONTH %s: mismatch (test_rows=%s test_uniq=%s prod_rows=%s prod_uniq=%s)",
+                label,
+                test_rows,
+                test_uniq,
+                prod_rows,
+                prod_uniq,
+            )
+            for day in iter_days(month_start, month_end):
+                ok = reconcile_day_with_test(ch_test, ch_prod, day, dedup=dedup) and ok
+    return ok
+
+
+def run_simple_pipeline(
+    ch_test: CH,
+    ch_prod: CH,
+    client: FGISClient,
+    start: date,
+    end: date,
+    rows: int,
+    sleep_s: float,
+) -> bool:
+    now = datetime.now()
+    recent_start = max(start, end - timedelta(days=SIMPLE_RECENT_DAYS))
+    log.info("SIMPLE: reconcile test vs remote (recent %s → %s)", recent_start, end)
+    test_ok = reconcile_remote_by_year_month(ch_test, client, recent_start, end, rows, sleep_s)
+    if _should_run(ch_test, "simple_remote_full", timedelta(hours=SIMPLE_REMOTE_FULL_EVERY_HOURS), now):
+        log.info("SIMPLE: reconcile test vs remote (full %s → %s)", start, end)
+        test_ok = reconcile_remote_by_year_month(ch_test, client, start, end, rows, sleep_s) and test_ok
+        _state_set(ch_test, "simple_remote_full", datetime.now())
+
+    prod_ok = True
+    if _should_run(ch_prod, "simple_prod_full", timedelta(hours=SIMPLE_REMOTE_FULL_EVERY_HOURS), now):
+        log.info("SIMPLE: reconcile prod vs test (full %s → %s)", start, end)
+        prod_ok = reconcile_prod_by_year_month(ch_test, ch_prod, start, end, dedup=True)
+        _state_set(ch_prod, "simple_prod_full", datetime.now())
+        _state_set(ch_prod, "simple_prod_recent", datetime.now())
+    elif _should_run(ch_prod, "simple_prod_recent", timedelta(hours=SIMPLE_PROD_SYNC_EVERY_HOURS), now):
+        log.info("SIMPLE: reconcile prod vs test (recent %s → %s)", recent_start, end)
+        prod_ok = reconcile_prod_by_year_month(ch_test, ch_prod, recent_start, end, dedup=True)
+        _state_set(ch_prod, "simple_prod_recent", datetime.now())
+    return test_ok and prod_ok
 
 
 def _extract_manufacturer(details: dict[str, Any], list_doc: dict[str, Any]) -> tuple[str, Any]:
@@ -1099,9 +1394,9 @@ def main() -> None:
     proxy = os.getenv("HTTPS_PROXY") or os.getenv("HTTP_PROXY") or None
 
     mit_rows = int(os.getenv("MIT_ROWS", "1000"))
-    vri_rows = int(os.getenv("VRI_ROWS", "1000"))
+    vri_rows = int(os.getenv("VRI_ROWS", str(DEFAULT_VRI_ROWS)))
     mit_sleep = float(os.getenv("MIT_SLEEP", "0.2"))
-    vri_sleep = float(os.getenv("VRI_SLEEP", "0.2"))
+    vri_sleep = float(os.getenv("VRI_SLEEP", str(DEFAULT_VRI_SLEEP)))
     tail_days = int(os.getenv("VRI_TAIL_DAYS", "3"))
     start_date_env = os.getenv("START_DATE", "").strip()
     end_date_env = os.getenv("END_DATE", "").strip()
@@ -1112,6 +1407,7 @@ def main() -> None:
     backfill_env = os.getenv("BACKFILL_DATES", "")
     backfill_list = parse_backfill_dates(backfill_env)
 
+    simple_mode = _env_flag("SIMPLE_MODE", True)
     sync_mit = _env_flag("SYNC_MIT", True)
     sync_vri = _env_flag("SYNC_VRI", True)
     reconcile_vri = _env_flag("RECONCILE_VRI", False)
@@ -1160,6 +1456,13 @@ def main() -> None:
     ch_prod = CH(host, port, user, password, db_prod)
 
     client = FGISClient(proxy=proxy, rps=rps)
+
+    if simple_mode:
+        start = start_date or DEFAULT_START_DATE
+        end = end_date or date.today()
+        log.info("SIMPLE: start (%s → %s)", start, end)
+        run_simple_pipeline(ch_test, ch_prod, client, start, end, vri_rows, vri_sleep)
+        return
 
     now = datetime.now()
     run_ok = True

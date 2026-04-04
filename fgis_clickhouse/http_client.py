@@ -40,6 +40,10 @@ class HttpClient:
         self._session = requests.Session()
         self._rps = max(self.rps, MIN_RPS)
         self._proxies = {"http": self.proxy, "https": self.proxy} if self.proxy else None
+        try:
+            self.timeout = max(1, int(os.getenv("HTTP_TIMEOUT", str(self.timeout))))
+        except Exception:
+            self.timeout = 40
         self._max_retries = max(1, int(os.getenv("HTTP_MAX_RETRIES", "5")))
         self._base_sleep = float(os.getenv("HTTP_BASE_SLEEP", "1.0"))
         self._max_sleep = float(os.getenv("HTTP_MAX_SLEEP", "30.0"))

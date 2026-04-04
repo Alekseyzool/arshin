@@ -1012,7 +1012,13 @@ def sync_mit_registry(
     while True:
         page_num += 1
         page_cursor = cursor_mark
-        docs, next_cursor = client.mit_list_cursor(cursor_mark=cursor_mark, rows=rows)
+        try:
+            docs, next_cursor = client.mit_list_cursor(cursor_mark=cursor_mark, rows=rows)
+        except Exception as exc:
+            log.error("MIT list: page=%s cursor=%s fetch failed: %s", page_num, page_cursor, exc)
+            raise RuntimeError(
+                f"MIT list fetch failed on page={page_num} cursor={page_cursor}: {exc}"
+            ) from exc
         if not docs:
             stop_reason = f"page={page_num}: empty response"
             log.info(

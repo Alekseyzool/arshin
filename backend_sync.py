@@ -996,15 +996,19 @@ def sync_mit_registry(
     fetch_details: bool,
     stop_on_existing: bool,
     empty_pages_limit: int = 0,
+    min_rows: int = 10,
 ) -> int:
     cursor_mark = "*"
     total = 0
     page_num = 0
     empty_pages_in_row = 0
     stop_reason = "completed"
+    current_rows = max(rows, 1)
+    min_rows = max(1, min(min_rows, current_rows))
     log.info(
-        "MIT list: start rows=%s fetch_details=%s stop_on_existing=%s empty_pages_limit=%s",
-        rows,
+        "MIT list: start rows=%s min_rows=%s fetch_details=%s stop_on_existing=%s empty_pages_limit=%s",
+        current_rows,
+        min_rows,
         fetch_details,
         stop_on_existing,
         max(empty_pages_limit, 0),
@@ -1012,13 +1016,44 @@ def sync_mit_registry(
     while True:
         page_num += 1
         page_cursor = cursor_mark
-        try:
-            docs, next_cursor = client.mit_list_cursor(cursor_mark=cursor_mark, rows=rows)
-        except Exception as exc:
-            log.error("MIT list: page=%s cursor=%s fetch failed: %s", page_num, page_cursor, exc)
-            raise RuntimeError(
-                f"MIT list fetch failed on page={page_num} cursor={page_cursor}: {exc}"
-            ) from exc
+        page_rows = current_rows
+        while True:
+            try:
+                docs, next_cursor = client.mit_list_cursor(cursor_mark=cursor_mark, rows=page_rows)
+                if page_rows != current_rows:
+                    current_rows = page_rows
+                    log.info(
+                        "MIT list: page=%s cursor=%s fetch recovered with rows=%s",
+                        page_num,
+                        page_cursor,
+                        current_rows,
+                    )
+                break
+            except Exception as exc:
+                if page_rows > min_rows:
+                    next_rows = max(min_rows, page_rows // 2)
+                    if next_rows == page_rows:
+                        next_rows = min_rows
+                    log.warning(
+                        "MIT list: page=%s cursor=%s fetch failed with rows=%s: %s -> retry rows=%s",
+                        page_num,
+                        page_cursor,
+                        page_rows,
+                        exc,
+                        next_rows,
+                    )
+                    page_rows = next_rows
+                    continue
+                log.error(
+                    "MIT list: page=%s cursor=%s fetch failed with rows=%s: %s",
+                    page_num,
+                    page_cursor,
+                    page_rows,
+                    exc,
+                )
+                raise RuntimeError(
+                    f"MIT list fetch failed on page={page_num} cursor={page_cursor} rows={page_rows}: {exc}"
+                ) from exc
         if not docs:
             stop_reason = f"page={page_num}: empty response"
             log.info(
@@ -1512,6 +1547,7 @@ def main() -> None:
     mit_full_scan = _env_flag("MIT_FULL_SCAN", False)
     # 0 = disable early stop and scan the full cursor safely.
     mit_stop_after_empty_pages = max(_env_int("MIT_STOP_AFTER_EMPTY_PAGES", 0), 0)
+    mit_min_rows = max(1, min(_env_int("MIT_MIN_ROWS", 10), mit_rows))
     mit_every_hours = _env_int("MIT_EVERY_HOURS", 3)
     transfer_enabled = _env_flag("TRANSFER_TO_PROD", True)
     transfer_every_hours = _env_int("TRANSFER_EVERY_HOURS", 1)
@@ -1620,6 +1656,7 @@ def main() -> None:
                     fetch_details,
                     not mit_full_scan,
                     mit_stop_after_empty_pages,
+                    mit_min_rows,
                 )
                 log.info("MIT registry sync (test): done (inserted=%s)", total)
                 _state_set(ch_test, "mit_registry", datetime.now())

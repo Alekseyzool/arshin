@@ -51,6 +51,7 @@ class HttpClient:
     def json(self, url: str) -> Dict[str, Any]:
         """Fetch JSON with throttling and shared session."""
         last_err: Optional[Exception] = None
+        last_detail = ""
         for attempt in range(self._max_retries):
             delay = random.uniform(0, 1.0 / self._rps)
             if delay > 0:
@@ -60,12 +61,15 @@ class HttpClient:
                 if response.status_code == 200:
                     return response.json()
                 if response.status_code in RETRY_STATUSES:
+                    last_detail = f"HTTP {response.status_code}"
                     sleep_s = min(self._max_sleep, self._base_sleep * (2**attempt)) + random.random()
                     time.sleep(sleep_s)
                     continue
                 response.raise_for_status()
             except Exception as exc:
                 last_err = exc
+                last_detail = str(exc)
                 sleep_s = min(self._max_sleep, self._base_sleep * (2**attempt)) + random.random()
                 time.sleep(sleep_s)
-        raise RuntimeError(f"Failed after {self._max_retries} retries: {last_err}")
+        detail = last_detail or str(last_err) or "unknown error"
+        raise RuntimeError(f"Failed after {self._max_retries} retries: {detail}")

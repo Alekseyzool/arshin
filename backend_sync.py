@@ -818,6 +818,25 @@ def _extract_country(source: Any, fallback_name: str) -> str:
         return detect_country(fallback_name)
     return "Не указано"
 
+def _extract_modifications(details: dict[str, Any]) -> str:
+    # Ищем поле модификаций в JSON
+    for key in ("j_modification", "modification", "modifications"):
+        val = details.get(key)
+        if not val:
+            continue
+        
+        # Если это список (List) -> превращаем в JSON-строку или текст
+        if isinstance(val, list):
+            # Пример: ["ОСЦ201", "ОСЦ202"] -> "ОСЦ201, ОСЦ202"
+            return ", ".join(str(v) for v in val)
+            
+        # Если это строка (иногда там JSON внутри строки)
+        if isinstance(val, str) and val.strip():
+            # Очищаем от лишних кавычек и скобок, если это массив-строка '["..."]'
+            cleaned = val.strip().replace('["', '').replace('"]', '').replace('","', ', ')
+            return cleaned
+            
+    return ""
 
 def _extract_mpi(details: dict[str, Any]) -> str:
     for key in ("mpi", "mpis", "j_mpis"):
@@ -865,6 +884,10 @@ def build_mit_row(list_doc: dict[str, Any], details: dict[str, Any], inserted_at
     valid_to = parse_date_any(details.get("valid_to") or details.get("validTo"))
     mpi = _extract_mpi(details)
     order_num, order_date = _extract_order(details)
+
+# --- НОВОЕ: Достаем модификации ---
+    j_mod = _extract_modifications(details)
+
     return (
         country,
         inserted_at,
@@ -874,6 +897,9 @@ def build_mit_row(list_doc: dict[str, Any], details: dict[str, Any], inserted_at
         mit_title,
         mpi,
         notation,
+
+	j_mod,  # <--- Вставляем сюда
+
         order_date,
         order_num,
         production_type,
@@ -893,6 +919,7 @@ def insert_mit_registry(ch: CH, rows: list[tuple[Any, ...]]) -> None:
             "mit_title",
             "mpi",
             "notation",
+	    "j_modification",
             "order_date",
             "order_num",
             "production_type",

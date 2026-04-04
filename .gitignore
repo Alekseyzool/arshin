@@ -5,3 +5,9 @@
 .vscode/
 .venv/
 venv/
+# logs / temp
+*.log
+*.err
+__pycache__/
+**/__pycache__/
+*.pyc

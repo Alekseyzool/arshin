@@ -818,24 +818,46 @@ def _extract_country(source: Any, fallback_name: str) -> str:
         return detect_country(fallback_name)
     return "Не указано"
 
+
+def _clean_scalar_text(value: Any) -> str:
+    if value is None:
+        return ""
+    text = str(value).strip()
+    if text in {"", "[]", "{}", "null", "None"}:
+        return ""
+    return text
+
+
 def _extract_modifications(details: dict[str, Any]) -> str:
-    # Ищем поле модификаций в JSON
     for key in ("j_modification", "modification", "modifications"):
         val = details.get(key)
         if not val:
             continue
-        
-        # Если это список (List) -> превращаем в JSON-строку или текст
-        if isinstance(val, list):
-            # Пример: ["ОСЦ201", "ОСЦ202"] -> "ОСЦ201, ОСЦ202"
-            return ", ".join(str(v) for v in val)
-            
-        # Если это строка (иногда там JSON внутри строки)
-        if isinstance(val, str) and val.strip():
-            # Очищаем от лишних кавычек и скобок, если это массив-строка '["..."]'
-            cleaned = val.strip().replace('["', '').replace('"]', '').replace('","', ', ')
-            return cleaned
-            
+
+        parsed = _json_loads_maybe(val)
+        source = parsed if parsed is not None else val
+        parts: list[str] = []
+
+        if isinstance(source, list):
+            for item in source:
+                if isinstance(item, dict):
+                    text = _extract_text(item, ("modification", "name", "title", "value"))
+                else:
+                    text = _clean_scalar_text(item)
+                if text:
+                    parts.append(text)
+        elif isinstance(source, dict):
+            text = _extract_text(source, ("modification", "name", "title", "value"))
+            if text:
+                parts.append(text)
+        else:
+            text = _clean_scalar_text(source)
+            if text:
+                parts.append(text)
+
+        if parts:
+            return ", ".join(parts)
+
     return ""
 
 def _extract_mpi(details: dict[str, Any]) -> str:
@@ -884,8 +906,6 @@ def build_mit_row(list_doc: dict[str, Any], details: dict[str, Any], inserted_at
     valid_to = parse_date_any(details.get("valid_to") or details.get("validTo"))
     mpi = _extract_mpi(details)
     order_num, order_date = _extract_order(details)
-
-# --- НОВОЕ: Достаем модификации ---
     j_mod = _extract_modifications(details)
 
     return (
@@ -897,9 +917,7 @@ def build_mit_row(list_doc: dict[str, Any], details: dict[str, Any], inserted_at
         mit_title,
         mpi,
         notation,
-
-	j_mod,  # <--- Вставляем сюда
-
+        j_mod,
         order_date,
         order_num,
         production_type,
@@ -919,7 +937,7 @@ def insert_mit_registry(ch: CH, rows: list[tuple[Any, ...]]) -> None:
             "mit_title",
             "mpi",
             "notation",
-	    "j_modification",
+            "j_modification",
             "order_date",
             "order_num",
             "production_type",
@@ -977,22 +995,63 @@ def sync_mit_registry(
     sleep_s: float,
     fetch_details: bool,
     stop_on_existing: bool,
+    empty_pages_limit: int = 0,
 ) -> int:
     cursor_mark = "*"
     total = 0
+    page_num = 0
+    empty_pages_in_row = 0
+    stop_reason = "completed"
+    log.info(
+        "MIT list: start rows=%s fetch_details=%s stop_on_existing=%s empty_pages_limit=%s",
+        rows,
+        fetch_details,
+        stop_on_existing,
+        max(empty_pages_limit, 0),
+    )
     while True:
+        page_num += 1
+        page_cursor = cursor_mark
         docs, next_cursor = client.mit_list_cursor(cursor_mark=cursor_mark, rows=rows)
         if not docs:
+            stop_reason = f"page={page_num}: empty response"
+            log.info(
+                "MIT list: page=%s cursor=%s docs=0 existing=0 missing=0 next_cursor=%s -> stop (%s)",
+                page_num,
+                page_cursor,
+                next_cursor or "",
+                stop_reason,
+            )
             break
         numbers = [doc.get("number") for doc in docs if doc.get("number")]
         existing = ch.existing_ids("mit_registry", "mit_number", numbers) if numbers else set()
         missing_docs = [doc for doc in docs if doc.get("number") and doc.get("number") not in existing]
+        existing_count = len(existing)
+        missing_count = len(missing_docs)
+        if missing_count == 0:
+            empty_pages_in_row += 1
+        else:
+            empty_pages_in_row = 0
+        log.info(
+            "MIT list: page=%s cursor=%s docs=%s existing=%s missing=%s next_cursor=%s empty_streak=%s",
+            page_num,
+            page_cursor,
+            len(docs),
+            existing_count,
+            missing_count,
+            next_cursor or "",
+            empty_pages_in_row,
+        )
         if not missing_docs:
-            log.info("MIT list: page has no new numbers")
-            if stop_on_existing:
-                log.info("MIT list: stop_on_existing -> stop")
+            if stop_on_existing and empty_pages_limit > 0 and empty_pages_in_row >= empty_pages_limit:
+                stop_reason = (
+                    f"page={page_num}: {empty_pages_in_row} consecutive pages without new mit_number"
+                )
+                log.info("MIT list: stop_on_existing threshold reached -> stop (%s)", stop_reason)
                 break
             if not next_cursor or next_cursor == cursor_mark:
+                stop_reason = f"page={page_num}: cursor exhausted after empty page"
+                log.info("MIT list: cursor exhausted -> stop (%s)", stop_reason)
                 break
             cursor_mark = next_cursor
             if sleep_s > 0:
@@ -1022,12 +1081,15 @@ def sync_mit_registry(
             insert_mit_registry(ch, buffer)
             inserted_now += len(buffer)
             total += len(buffer)
-        log.info("MIT list: inserted %s (total=%s)", inserted_now, total)
+        log.info("MIT list: page=%s inserted=%s total=%s", page_num, inserted_now, total)
         if not next_cursor or next_cursor == cursor_mark:
+            stop_reason = f"page={page_num}: cursor exhausted after inserts"
+            log.info("MIT list: cursor exhausted -> stop (%s)", stop_reason)
             break
         cursor_mark = next_cursor
         if sleep_s > 0:
             time.sleep(sleep_s)
+    log.info("MIT list: done pages=%s inserted_total=%s stop_reason=%s", page_num, total, stop_reason)
     return total
 
 
@@ -1442,6 +1504,8 @@ def main() -> None:
     skip_existing_vri = _env_flag("VRI_SKIP_EXISTING", True)
     vri_scheduled = _env_flag("VRI_SCHEDULED", True)
     mit_full_scan = _env_flag("MIT_FULL_SCAN", False)
+    # 0 = disable early stop and scan the full cursor safely.
+    mit_stop_after_empty_pages = max(_env_int("MIT_STOP_AFTER_EMPTY_PAGES", 0), 0)
     mit_every_hours = _env_int("MIT_EVERY_HOURS", 3)
     transfer_enabled = _env_flag("TRANSFER_TO_PROD", True)
     transfer_every_hours = _env_int("TRANSFER_EVERY_HOURS", 1)
@@ -1542,7 +1606,15 @@ def main() -> None:
         if mit_every_hours <= 0 or _should_run(ch_test, "mit_registry", timedelta(hours=mit_every_hours), now):
             log.info("MIT registry sync (test): start")
             try:
-                total = sync_mit_registry(ch_test, client, mit_rows, mit_sleep, fetch_details, not mit_full_scan)
+                total = sync_mit_registry(
+                    ch_test,
+                    client,
+                    mit_rows,
+                    mit_sleep,
+                    fetch_details,
+                    not mit_full_scan,
+                    mit_stop_after_empty_pages,
+                )
                 log.info("MIT registry sync (test): done (inserted=%s)", total)
                 _state_set(ch_test, "mit_registry", datetime.now())
             except Exception:

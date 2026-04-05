@@ -416,7 +416,7 @@ def remote_vri_count(client: FGISClient, fq: str) -> int:
             return int(num_found or 0)
         except Exception as exc:
             log.warning("remote_vri_count: vri_cursor fallback failed: %s", exc)
-    raise RuntimeError("FGISClient has neither vri_count nor vri_cursor fallback.")
+    raise RuntimeError("FGIS remote VRI count unavailable after vri_count and vri_cursor fallback errors.")
 
 
 def remote_vri_ids_for_day(
@@ -1194,7 +1194,14 @@ def sync_vri_range(
     cur = start
     while cur <= end:
         fq = fq_for_day(cur)
-        remote_rows = remote_vri_count(client, fq)
+        try:
+            remote_rows = remote_vri_count(client, fq)
+        except Exception as exc:
+            log.warning("VRI %s: remote count unavailable: %s -> fallback to direct sync", cur, exc)
+            loaded = sync_vri_day(ch, client, cur, rows, sleep_s, skip_existing, remote_total=None)
+            log.info("VRI %s: loaded=%s (fallback without remote count)", cur, loaded)
+            cur += timedelta(days=1)
+            continue
         if remote_rows == 0:
             cur += timedelta(days=1)
             continue

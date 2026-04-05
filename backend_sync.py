@@ -1600,6 +1600,7 @@ def main() -> None:
     now = datetime.now()
     run_ok = True
     reconcile_ok = True
+    mit_ok = True
 
     if backfill_list:
         log.info("BACKFILL: %s dates", len(backfill_list))
@@ -1661,7 +1662,7 @@ def main() -> None:
                 log.info("MIT registry sync (test): done (inserted=%s)", total)
                 _state_set(ch_test, "mit_registry", datetime.now())
             except Exception:
-                run_ok = False
+                mit_ok = False
                 log.exception("MIT registry sync (test): failed")
         else:
             log.info("MIT registry sync (test): skipped by schedule")
@@ -1694,14 +1695,17 @@ def main() -> None:
         else:
             log.info("TRANSFER: start")
             try:
-                transfer_table(
-                    ch_test,
-                    ch_prod,
-                    table="mit_registry",
-                    ts_col="inserted_at",
-                    state_key="transfer_mit",
-                    dedup=transfer_dedup,
-                )
+                if sync_mit and not mit_ok:
+                    log.warning("TRANSFER MIT: skipped because MIT sync failed")
+                else:
+                    transfer_table(
+                        ch_test,
+                        ch_prod,
+                        table="mit_registry",
+                        ts_col="inserted_at",
+                        state_key="transfer_mit",
+                        dedup=transfer_dedup,
+                    )
                 if promote_vri:
                     if not reconcile_vri:
                         log.warning("PROMOTE: reconcile disabled -> skip")

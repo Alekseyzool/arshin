@@ -1142,12 +1142,65 @@ def sync_vri_day(
     sleep_s: float,
     skip_existing: bool,
     remote_total: Optional[int] = None,
+    min_rows: Optional[int] = None,
 ) -> int:
     cursor_mark = "*"
     total = 0
     fq = fq_for_day(d)
+    page_num = 0
+    current_rows = max(rows, 1)
+    if min_rows is None:
+        min_rows = _env_int("VRI_MIN_ROWS", min(100, current_rows))
+    min_rows = max(1, min(min_rows, current_rows))
+    log.info("VRI %s: start rows=%s min_rows=%s", d, current_rows, min_rows)
     while True:
-        docs, num_found, next_cursor = client.vri_cursor(fq=fq, rows=rows, cursor_mark=cursor_mark)
+        page_num += 1
+        page_cursor = cursor_mark
+        page_rows = current_rows
+        while True:
+            try:
+                docs, num_found, next_cursor = client.vri_cursor(
+                    fq=fq,
+                    rows=page_rows,
+                    cursor_mark=cursor_mark,
+                )
+                if page_rows != current_rows:
+                    current_rows = page_rows
+                    log.info(
+                        "VRI %s: page=%s cursor=%s fetch recovered with rows=%s",
+                        d,
+                        page_num,
+                        page_cursor,
+                        current_rows,
+                    )
+                break
+            except Exception as exc:
+                if page_rows > min_rows:
+                    next_rows = max(min_rows, page_rows // 2)
+                    if next_rows == page_rows:
+                        next_rows = min_rows
+                    log.warning(
+                        "VRI %s: page=%s cursor=%s fetch failed with rows=%s: %s -> retry rows=%s",
+                        d,
+                        page_num,
+                        page_cursor,
+                        page_rows,
+                        exc,
+                        next_rows,
+                    )
+                    page_rows = next_rows
+                    continue
+                log.error(
+                    "VRI %s: page=%s cursor=%s fetch failed with rows=%s: %s",
+                    d,
+                    page_num,
+                    page_cursor,
+                    page_rows,
+                    exc,
+                )
+                raise RuntimeError(
+                    f"VRI day fetch failed for {d} page={page_num} cursor={page_cursor} rows={page_rows}: {exc}"
+                ) from exc
         if not docs:
             break
         if remote_total is None:
@@ -1168,8 +1221,11 @@ def sync_vri_day(
             insert_verifications(ch, rows_to_insert)
             total += len(rows_to_insert)
         log.info(
-            "%s: +%s (loaded=%s / remote=%s)",
+            "%s: page=%s docs=%s rows=%s +%s (loaded=%s / remote=%s)",
             d,
+            page_num,
+            len(docs),
+            page_rows,
             len(rows_to_insert),
             total,
             remote_total if remote_total is not None else num_found,

@@ -447,7 +447,8 @@ def iter_vri_pages(
     seen_docs = 0
     page_num = 0
     use_offset = False
-    current_rows = max(rows, 1)
+    configured_rows = max(rows, 1)
+    current_rows = configured_rows
     if min_rows is None:
         min_rows = _env_int("VRI_MIN_ROWS", min(DEFAULT_VRI_MIN_ROWS, current_rows))
     min_rows = max(1, min(min_rows, current_rows))
@@ -516,16 +517,19 @@ def iter_vri_pages(
                     page_rows = next_rows
                     continue
                 if not use_offset:
-                    current_rows = page_rows
+                    failed_rows = page_rows
                     use_offset = True
+                    current_rows = configured_rows
+                    page_rows = current_rows
                     log.warning(
-                        "VRI %s: page=%s cursor=%s fetch failed with rows=%s: %s -> switch to start=%s",
+                        "VRI %s: page=%s cursor=%s fetch failed with rows=%s: %s -> switch to start=%s reset rows=%s",
                         d,
                         page_num,
                         page_cursor,
-                        page_rows,
+                        failed_rows,
                         exc,
                         page_start,
+                        current_rows,
                     )
                     continue
                 log.error(

@@ -147,6 +147,31 @@ class FGISClient:
         response = payload.get("response") or {}
         return int(response.get("numFound", 0))
 
+    def vri_page(
+        self,
+        *,
+        fq: Optional[str],
+        rows: int,
+        start: int,
+        sort: str = "vri_id asc",
+    ) -> Tuple[List[Dict[str, str]], int]:
+        """Fetch a VRI page with start-based pagination and return docs, numFound."""
+        sort_param = sort.replace(" ", "+")
+        params = [
+            "q=*",
+            f"fl={VRI_FL}",
+            f"rows={rows}",
+            f"start={max(0, start)}",
+            "sort=" + request_utils.quote(sort_param, safe=",+"),
+        ]
+        if fq:
+            params.append("fq=" + request_utils.quote(fq, safe=":*[]/ "))
+        url = VRI_SEARCH_BASE + "?" + "&".join(params)
+        payload = self._http.json(url)
+        response = payload.get("response") or {}
+        docs = response.get("docs") or []
+        return docs, int(response.get("numFound", 0))
+
     def vri_cursor(
         self,
         *,

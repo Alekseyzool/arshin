@@ -7,7 +7,7 @@ import logging
 import os
 import time
 from datetime import date, datetime, timedelta
-from typing import Any, Optional, Iterable
+from typing import Any, Optional, Iterable, Iterator
 
 from dotenv import load_dotenv
 
@@ -24,6 +24,7 @@ log = logging.getLogger("fgis_backend")
 DEFAULT_START_DATE = date(2020, 1, 1)
 DEFAULT_VRI_ROWS = 9999
 DEFAULT_VRI_SLEEP = 0.0
+DEFAULT_VRI_MIN_ROWS = 10
 SIMPLE_RECENT_DAYS = 14
 SIMPLE_REMOTE_FULL_EVERY_HOURS = 24
 SIMPLE_PROD_SYNC_EVERY_HOURS = 4
@@ -425,23 +426,141 @@ def remote_vri_ids_for_day(
     rows: int,
     sleep_s: float,
 ) -> set[str]:
-    fq = fq_for_day(d)
-    cursor_mark = "*"
     ids: set[str] = set()
-    while True:
-        docs, _num_found, next_cursor = client.vri_cursor(fq=fq, rows=rows, cursor_mark=cursor_mark)
-        if not docs:
-            break
+    for docs, _num_found, _page_num, _page_rows, _page_mode in iter_vri_pages(client, d, rows, sleep_s):
         for doc in docs:
             vri_id = doc.get("vri_id")
             if vri_id:
                 ids.add(str(vri_id))
-        if not next_cursor or next_cursor == cursor_mark:
+    return ids
+
+
+def iter_vri_pages(
+    client: FGISClient,
+    d: date,
+    rows: int,
+    sleep_s: float,
+    min_rows: Optional[int] = None,
+) -> Iterator[tuple[list[dict[str, Any]], int, int, int, str]]:
+    fq = fq_for_day(d)
+    cursor_mark = "*"
+    seen_docs = 0
+    page_num = 0
+    use_offset = False
+    current_rows = max(rows, 1)
+    if min_rows is None:
+        min_rows = _env_int("VRI_MIN_ROWS", min(DEFAULT_VRI_MIN_ROWS, current_rows))
+    min_rows = max(1, min(min_rows, current_rows))
+    log.info("VRI %s: start rows=%s min_rows=%s", d, current_rows, min_rows)
+    while True:
+        page_num += 1
+        page_rows = current_rows
+        page_cursor = cursor_mark
+        page_start = seen_docs
+        num_found = 0
+        next_cursor: Optional[str] = None
+        while True:
+            try:
+                if use_offset:
+                    docs, num_found = client.vri_page(fq=fq, rows=page_rows, start=page_start)
+                else:
+                    docs, num_found, next_cursor = client.vri_cursor(
+                        fq=fq,
+                        rows=page_rows,
+                        cursor_mark=cursor_mark,
+                    )
+                if page_rows != current_rows:
+                    current_rows = page_rows
+                    if use_offset:
+                        log.info(
+                            "VRI %s: page=%s start=%s fetch recovered with rows=%s",
+                            d,
+                            page_num,
+                            page_start,
+                            current_rows,
+                        )
+                    else:
+                        log.info(
+                            "VRI %s: page=%s cursor=%s fetch recovered with rows=%s",
+                            d,
+                            page_num,
+                            page_cursor,
+                            current_rows,
+                        )
+                break
+            except Exception as exc:
+                if page_rows > min_rows:
+                    next_rows = max(min_rows, page_rows // 2)
+                    if next_rows == page_rows:
+                        next_rows = min_rows
+                    if use_offset:
+                        log.warning(
+                            "VRI %s: page=%s start=%s fetch failed with rows=%s: %s -> retry rows=%s",
+                            d,
+                            page_num,
+                            page_start,
+                            page_rows,
+                            exc,
+                            next_rows,
+                        )
+                    else:
+                        log.warning(
+                            "VRI %s: page=%s cursor=%s fetch failed with rows=%s: %s -> retry rows=%s",
+                            d,
+                            page_num,
+                            page_cursor,
+                            page_rows,
+                            exc,
+                            next_rows,
+                        )
+                    page_rows = next_rows
+                    continue
+                if not use_offset:
+                    current_rows = page_rows
+                    use_offset = True
+                    log.warning(
+                        "VRI %s: page=%s cursor=%s fetch failed with rows=%s: %s -> switch to start=%s",
+                        d,
+                        page_num,
+                        page_cursor,
+                        page_rows,
+                        exc,
+                        page_start,
+                    )
+                    continue
+                log.error(
+                    "VRI %s: page=%s start=%s fetch failed with rows=%s: %s",
+                    d,
+                    page_num,
+                    page_start,
+                    page_rows,
+                    exc,
+                )
+                raise RuntimeError(
+                    f"VRI day fetch failed for {d} page={page_num} start={page_start} rows={page_rows}: {exc}"
+                ) from exc
+        if not docs:
+            if use_offset and seen_docs < num_found:
+                log.warning(
+                    "VRI %s: page=%s start=%s returned docs=0 before remote_total=%s -> stop",
+                    d,
+                    page_num,
+                    page_start,
+                    num_found,
+                )
             break
-        cursor_mark = next_cursor
+        page_mode = "start" if use_offset else "cursor"
+        yield docs, num_found, page_num, page_rows, page_mode
+        seen_docs += len(docs)
+        if use_offset:
+            if seen_docs >= num_found:
+                break
+        else:
+            if not next_cursor or next_cursor == cursor_mark:
+                break
+            cursor_mark = next_cursor
         if sleep_s > 0:
             time.sleep(sleep_s)
-    return ids
 
 
 def local_vri_ids_for_day(ch: CH, d: date) -> set[str]:
@@ -1144,65 +1263,14 @@ def sync_vri_day(
     remote_total: Optional[int] = None,
     min_rows: Optional[int] = None,
 ) -> int:
-    cursor_mark = "*"
     total = 0
-    fq = fq_for_day(d)
-    page_num = 0
-    current_rows = max(rows, 1)
-    if min_rows is None:
-        min_rows = _env_int("VRI_MIN_ROWS", min(100, current_rows))
-    min_rows = max(1, min(min_rows, current_rows))
-    log.info("VRI %s: start rows=%s min_rows=%s", d, current_rows, min_rows)
-    while True:
-        page_num += 1
-        page_cursor = cursor_mark
-        page_rows = current_rows
-        while True:
-            try:
-                docs, num_found, next_cursor = client.vri_cursor(
-                    fq=fq,
-                    rows=page_rows,
-                    cursor_mark=cursor_mark,
-                )
-                if page_rows != current_rows:
-                    current_rows = page_rows
-                    log.info(
-                        "VRI %s: page=%s cursor=%s fetch recovered with rows=%s",
-                        d,
-                        page_num,
-                        page_cursor,
-                        current_rows,
-                    )
-                break
-            except Exception as exc:
-                if page_rows > min_rows:
-                    next_rows = max(min_rows, page_rows // 2)
-                    if next_rows == page_rows:
-                        next_rows = min_rows
-                    log.warning(
-                        "VRI %s: page=%s cursor=%s fetch failed with rows=%s: %s -> retry rows=%s",
-                        d,
-                        page_num,
-                        page_cursor,
-                        page_rows,
-                        exc,
-                        next_rows,
-                    )
-                    page_rows = next_rows
-                    continue
-                log.error(
-                    "VRI %s: page=%s cursor=%s fetch failed with rows=%s: %s",
-                    d,
-                    page_num,
-                    page_cursor,
-                    page_rows,
-                    exc,
-                )
-                raise RuntimeError(
-                    f"VRI day fetch failed for {d} page={page_num} cursor={page_cursor} rows={page_rows}: {exc}"
-                ) from exc
-        if not docs:
-            break
+    for docs, num_found, page_num, page_rows, page_mode in iter_vri_pages(
+        client,
+        d,
+        rows,
+        sleep_s,
+        min_rows=min_rows,
+    ):
         if remote_total is None:
             remote_total = num_found
         docs_to_insert = docs
@@ -1221,20 +1289,16 @@ def sync_vri_day(
             insert_verifications(ch, rows_to_insert)
             total += len(rows_to_insert)
         log.info(
-            "%s: page=%s docs=%s rows=%s +%s (loaded=%s / remote=%s)",
+            "%s: page=%s mode=%s docs=%s rows=%s +%s (loaded=%s / remote=%s)",
             d,
             page_num,
+            page_mode,
             len(docs),
             page_rows,
             len(rows_to_insert),
             total,
             remote_total if remote_total is not None else num_found,
         )
-        if not next_cursor or next_cursor == cursor_mark:
-            break
-        cursor_mark = next_cursor
-        if sleep_s > 0:
-            time.sleep(sleep_s)
     return total
 
 

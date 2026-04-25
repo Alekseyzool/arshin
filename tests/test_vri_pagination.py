@@ -50,8 +50,18 @@ class _FakeCH:
     def insert(self, table: str, columns: list[str], rows: list[tuple[object, ...]]) -> None:
         self.rows.extend(rows)
 
+    def scalar(self, sql: str):
+        return date(2026, 4, 16)
+
 
 class CursorFallbackTests(unittest.TestCase):
+    def test_resolve_vri_start_date_honors_explicit_start(self) -> None:
+        explicit = date(2026, 4, 2)
+        self.assertEqual(
+            backend_sync.resolve_vri_start_date(_FakeCH(), explicit, tail_days=3),
+            explicit,
+        )
+
     def test_sync_vri_day_switches_from_cursor_to_start(self) -> None:
         docs = [_doc("1"), _doc("2"), _doc("3"), _doc("4")]
 
@@ -123,3 +133,26 @@ class CursorFallbackTests(unittest.TestCase):
             ],
         )
         self.assertEqual(client.start_attempts, [(2, 4), (2, 2)])
+
+    def test_iter_vri_pages_raises_clear_error_when_start_limit_would_be_exceeded(self) -> None:
+        docs = [_doc("1")] * 10001
+
+        class FakeClient:
+            def vri_cursor(self, *, fq: str | None, rows: int, cursor_mark: str, sort: str = "vri_id asc"):
+                if cursor_mark == "*":
+                    return docs[:10000], 20000, "broken-cursor"
+                raise RuntimeError(f"HTTP 429 on cursor {cursor_mark} rows={rows}")
+
+            def vri_page(self, *, fq: str | None, rows: int, start: int, sort: str = "vri_id asc"):
+                raise AssertionError("start fallback must not be attempted beyond the FGIS limit")
+
+        pages = backend_sync.iter_vri_pages(
+            FakeClient(),
+            date(2026, 4, 7),
+            rows=10000,
+            sleep_s=0.0,
+            min_rows=10,
+        )
+        next(pages)
+        with self.assertRaisesRegex(RuntimeError, r"start fallback is unavailable beyond start=9999"):
+            next(pages)

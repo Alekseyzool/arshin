@@ -17,7 +17,9 @@ UA_POOL = [
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_5) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Safari/605.1.15",
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36",
 ]
-MIN_RPS = 0.2
+# Keep a small floor only to avoid division by zero. If the operator chooses a
+# very slow poll rate, we should honor it instead of silently speeding up.
+MIN_RPS = 0.05
 RETRY_STATUSES = {429, 500, 502, 503, 504}
 
 
@@ -36,7 +38,7 @@ class HttpClient:
 
     proxy: Optional[str]
     rps: float
-    timeout: int = 40
+    timeout: int = 120
 
     def __post_init__(self) -> None:
         self._session = requests.Session()
@@ -47,10 +49,10 @@ class HttpClient:
         try:
             self.timeout = max(1, int(os.getenv("HTTP_TIMEOUT", str(self.timeout))))
         except Exception:
-            self.timeout = 40
-        self._max_retries = max(1, int(os.getenv("HTTP_MAX_RETRIES", "5")))
-        self._base_sleep = float(os.getenv("HTTP_BASE_SLEEP", "1.0"))
-        self._max_sleep = float(os.getenv("HTTP_MAX_SLEEP", "30.0"))
+            self.timeout = 120
+        self._max_retries = max(1, int(os.getenv("HTTP_MAX_RETRIES", "10")))
+        self._base_sleep = float(os.getenv("HTTP_BASE_SLEEP", "5.0"))
+        self._max_sleep = float(os.getenv("HTTP_MAX_SLEEP", "120.0"))
 
     def _wait_for_slot(self) -> None:
         """Ensure request start rate does not exceed the configured RPS."""
@@ -99,14 +101,16 @@ class HttpClient:
                     return response.json()
                 if response.status_code in RETRY_STATUSES:
                     last_detail = f"HTTP {response.status_code}"
-                    sleep_s = self._retry_sleep_seconds(attempt, response.headers.get("Retry-After"))
-                    time.sleep(sleep_s)
+                    if attempt + 1 < self._max_retries:
+                        sleep_s = self._retry_sleep_seconds(attempt, response.headers.get("Retry-After"))
+                        time.sleep(sleep_s)
                     continue
                 response.raise_for_status()
             except Exception as exc:
                 last_err = exc
                 last_detail = str(exc)
-                sleep_s = self._retry_sleep_seconds(attempt)
-                time.sleep(sleep_s)
+                if attempt + 1 < self._max_retries:
+                    sleep_s = self._retry_sleep_seconds(attempt)
+                    time.sleep(sleep_s)
         detail = last_detail or str(last_err) or "unknown error"
         raise RuntimeError(f"Failed after {self._max_retries} retries: {detail}")

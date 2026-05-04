@@ -96,7 +96,7 @@ class CursorFallbackTests(unittest.TestCase):
         self.assertEqual([row[-1] for row in ch.rows], ["1", "2", "3", "4"])
         self.assertEqual(client.page_calls, [(2, 4)])
 
-    def test_iter_vri_pages_can_keep_shrinking_after_switch_to_start(self) -> None:
+    def test_iter_vri_pages_keeps_rows_fixed_after_switch_to_start(self) -> None:
         docs = [_doc("1"), _doc("2"), _doc("3"), _doc("4")]
 
         class FakeClient:
@@ -110,8 +110,6 @@ class CursorFallbackTests(unittest.TestCase):
 
             def vri_page(self, *, fq: str | None, rows: int, start: int, sort: str = "vri_id asc"):
                 self.start_attempts.append((start, rows))
-                if start == 2 and rows == 4:
-                    raise RuntimeError("HTTP 500 on start page")
                 return docs[start : start + rows], len(docs)
 
         client = FakeClient()
@@ -129,10 +127,10 @@ class CursorFallbackTests(unittest.TestCase):
             [(page_num, page_rows, page_mode, [doc["vri_id"] for doc in page_docs]) for page_docs, _, page_num, page_rows, page_mode in pages],
             [
                 (1, 4, "cursor", ["1", "2"]),
-                (2, 2, "start", ["3", "4"]),
+                (2, 4, "start", ["3", "4"]),
             ],
         )
-        self.assertEqual(client.start_attempts, [(2, 4), (2, 2)])
+        self.assertEqual(client.start_attempts, [(2, 4)])
 
     def test_iter_vri_pages_raises_clear_error_when_start_limit_would_be_exceeded(self) -> None:
         docs = [_doc("1")] * 10001

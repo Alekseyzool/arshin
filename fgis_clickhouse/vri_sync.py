@@ -16,7 +16,6 @@ from .dates import (
 )
 from .fgis_api import FGISClient
 from .runtime import (
-    DEFAULT_VRI_MIN_ROWS,
     MAX_VRI_START_FALLBACK,
 )
 
@@ -123,11 +122,11 @@ def iter_vri_pages(
 ) -> Iterator[tuple[list[dict[str, Any]], int, int, int, str]]:
     """Yield all VRI pages for one day with defensive FGIS pagination.
 
-    Normal path uses Solr cursorMark because it is stable for large days. If a
-    page starts failing with retryable HTTP errors, the page size is repeatedly
-    reduced down to `min_rows`. Only when cursor pagination is still broken do
-    we fall back to start-based pagination, and only while the offset is inside
-    the known FGIS limit.
+    Normal path uses Solr cursorMark because it is stable for large days. We
+    keep the configured page size fixed: reducing `rows` creates many more
+    requests and makes large FGIS days less stable. Small-offset failures can
+    fall back to start-based pagination; deep cursor failures must be handled by
+    slower request rate and longer HTTP retries.
     """
     fq = fq_for_day(d)
     cursor_mark = "*"
@@ -135,97 +134,48 @@ def iter_vri_pages(
     page_num = 0
     use_offset = False
     configured_rows = max(rows, 1)
-    current_rows = configured_rows
-    if min_rows is None:
-        min_rows = min(DEFAULT_VRI_MIN_ROWS, current_rows)
-    min_rows = max(1, min(min_rows, current_rows))
-    log.info("VRI %s: start rows=%s min_rows=%s", d, current_rows, min_rows)
+    if min_rows is not None:
+        log.info("VRI %s: ignoring min_rows=%s; cursor rows stay fixed", d, min_rows)
+    log.info("VRI %s: start rows=%s", d, configured_rows)
     while True:
         page_num += 1
-        page_rows = current_rows
+        page_rows = configured_rows
         page_cursor = cursor_mark
         page_start = seen_docs
         num_found = 0
         next_cursor: Optional[str] = None
-        while True:
-            try:
-                if use_offset:
-                    docs, num_found = client.vri_page(fq=fq, rows=page_rows, start=page_start)
-                else:
-                    docs, num_found, next_cursor = client.vri_cursor(
-                        fq=fq,
-                        rows=page_rows,
-                        cursor_mark=cursor_mark,
-                    )
-                if page_rows != current_rows:
-                    current_rows = page_rows
-                    if use_offset:
-                        log.info(
-                            "VRI %s: page=%s start=%s fetch recovered with rows=%s",
-                            d,
-                            page_num,
-                            page_start,
-                            current_rows,
-                        )
-                    else:
-                        log.info(
-                            "VRI %s: page=%s cursor=%s fetch recovered with rows=%s",
-                            d,
-                            page_num,
-                            page_cursor,
-                            current_rows,
-                        )
-                break
-            except Exception as exc:
-                if page_rows > min_rows:
-                    next_rows = max(min_rows, page_rows // 2)
-                    if next_rows == page_rows:
-                        next_rows = min_rows
-                    if use_offset:
-                        log.warning(
-                            "VRI %s: page=%s start=%s fetch failed with rows=%s: %s -> retry rows=%s",
-                            d,
-                            page_num,
-                            page_start,
-                            page_rows,
-                            exc,
-                            next_rows,
-                        )
-                    else:
-                        log.warning(
-                            "VRI %s: page=%s cursor=%s fetch failed with rows=%s: %s -> retry rows=%s",
-                            d,
-                            page_num,
-                            page_cursor,
-                            page_rows,
-                            exc,
-                            next_rows,
-                        )
-                    page_rows = next_rows
-                    continue
-                if not use_offset:
-                    if page_start > MAX_VRI_START_FALLBACK:
-                        raise RuntimeError(
-                            "FGIS VRI start fallback is unavailable beyond start="
-                            f"{MAX_VRI_START_FALLBACK}; cursor failed at page={page_num} "
-                            f"cursor={page_cursor} rows={page_rows} offset={page_start}. "
-                            "Retry with lower FGIS_RPS / higher backoff to stay on cursor pagination."
-                        ) from exc
-                    failed_rows = page_rows
+        try:
+            if use_offset:
+                docs, num_found = client.vri_page(fq=fq, rows=page_rows, start=page_start)
+            else:
+                docs, num_found, next_cursor = client.vri_cursor(
+                    fq=fq,
+                    rows=page_rows,
+                    cursor_mark=cursor_mark,
+                )
+        except Exception as exc:
+            if not use_offset:
+                if page_start <= MAX_VRI_START_FALLBACK:
                     use_offset = True
-                    current_rows = configured_rows
-                    page_rows = current_rows
                     log.warning(
-                        "VRI %s: page=%s cursor=%s fetch failed with rows=%s: %s -> switch to start=%s reset rows=%s",
+                        "VRI %s: page=%s cursor=%s fetch failed with rows=%s: %s -> switch to start=%s rows=%s",
                         d,
                         page_num,
                         page_cursor,
-                        failed_rows,
+                        page_rows,
                         exc,
                         page_start,
-                        current_rows,
+                        configured_rows,
                     )
-                    continue
+                    docs, num_found = client.vri_page(fq=fq, rows=configured_rows, start=page_start)
+                else:
+                    raise RuntimeError(
+                        "FGIS VRI start fallback is unavailable beyond start="
+                        f"{MAX_VRI_START_FALLBACK}; cursor failed at page={page_num} "
+                        f"cursor={page_cursor} rows={page_rows} offset={page_start}. "
+                        "Retry with lower FGIS_RPS / higher HTTP backoff; rows are kept fixed."
+                    ) from exc
+            else:
                 log.error(
                     "VRI %s: page=%s start=%s fetch failed with rows=%s: %s",
                     d,
@@ -269,6 +219,37 @@ def delete_vri_day(ch: CH, d: date) -> None:
         {"day": day_str},
     )
 
+def ensure_vri_reload_table(ch: CH) -> str:
+    """Create a staging table used to make VRI day reloads atomic enough.
+
+    FGIS can fail midway through a large day. Loading into a staging table first
+    lets us keep the old production/test day intact until the new copy has the
+    expected row count.
+    """
+    table = "verifications_reload_tmp"
+    ch.exec(
+        f"CREATE TABLE IF NOT EXISTS {ch.db}.{table} "
+        f"AS {ch.db}.verifications "
+        "ENGINE = MergeTree "
+        "PARTITION BY toYYYYMM(verification_date) "
+        "ORDER BY (verification_date, vri_id)"
+    )
+    return table
+
+def truncate_vri_reload_table(ch: CH, table: str) -> None:
+    ch.exec(f"TRUNCATE TABLE {ch.db}.{table}")
+
+def local_vri_stats_for_table(ch: CH, table: str, d: date) -> tuple[int, int]:
+    """Return row and unique-id counts for one day in a specific table."""
+    day_str = d.strftime("%Y-%m-%d")
+    rows = ch.rows(
+        f"SELECT count(), uniqExact(vri_id) FROM {ch.db}.{table} "
+        f"WHERE verification_date = toDate('{day_str}')"
+    )
+    if not rows:
+        return 0, 0
+    return int(rows[0][0] or 0), int(rows[0][1] or 0)
+
 def reload_vri_day_from_remote(
     ch: CH,
     client: FGISClient,
@@ -277,9 +258,44 @@ def reload_vri_day_from_remote(
     sleep_s: float,
 ) -> bool:
     remote_rows = remote_vri_count(client, fq_for_day(d))
-    delete_vri_day(ch, d)
-    if remote_rows > 0:
-        sync_vri_day(ch, client, d, rows, sleep_s, skip_existing=False, remote_total=remote_rows)
+    stage_table = ensure_vri_reload_table(ch)
+    truncate_vri_reload_table(ch, stage_table)
+    try:
+        if remote_rows > 0:
+            sync_vri_day(
+                ch,
+                client,
+                d,
+                rows,
+                sleep_s,
+                skip_existing=False,
+                remote_total=remote_rows,
+                table=stage_table,
+            )
+        stage_rows, stage_uniq = local_vri_stats_for_table(ch, stage_table, d)
+        if stage_rows != stage_uniq or stage_uniq != remote_rows:
+            log.warning(
+                "REMOTE %s: staging mismatch (rows=%s uniq=%s remote=%s)",
+                d,
+                stage_rows,
+                stage_uniq,
+                remote_rows,
+            )
+            return False
+        delete_vri_day(ch, d)
+        if remote_rows > 0:
+            day_str = d.strftime("%Y-%m-%d")
+            ch.exec(
+                f"INSERT INTO {ch.db}.verifications "
+                f"SELECT * FROM {ch.db}.{stage_table} "
+                f"WHERE verification_date = toDate(%(day)s)",
+                {"day": day_str},
+            )
+    finally:
+        try:
+            truncate_vri_reload_table(ch, stage_table)
+        except Exception:
+            log.exception("REMOTE %s: failed to truncate staging table", d)
     local_rows, local_uniq = local_vri_stats(ch, d)
     if local_rows == local_uniq == remote_rows:
         log.info("REMOTE %s: OK (rows=%s uniq=%s remote=%s)", d, local_rows, local_uniq, remote_rows)
@@ -505,9 +521,9 @@ def build_vri_row(doc: dict[str, Any], inserted_at: datetime) -> Optional[tuple[
         vri_id,
     )
 
-def insert_verifications(ch: CH, rows: list[tuple[Any, ...]]) -> None:
+def insert_verifications(ch: CH, rows: list[tuple[Any, ...]], table: str = "verifications") -> None:
     ch.insert(
-        "verifications",
+        table,
         [
             "applicability",
             "inserted_at",
@@ -533,6 +549,7 @@ def sync_vri_day(
     skip_existing: bool,
     remote_total: Optional[int] = None,
     min_rows: Optional[int] = None,
+    table: str = "verifications",
 ) -> int:
     """Load one VRI day into ClickHouse, optionally skipping already seen IDs."""
     total = 0
@@ -558,7 +575,7 @@ def sync_vri_day(
             if row:
                 rows_to_insert.append(row)
         if rows_to_insert:
-            insert_verifications(ch, rows_to_insert)
+            insert_verifications(ch, rows_to_insert, table=table)
             total += len(rows_to_insert)
         log.info(
             "%s: page=%s mode=%s docs=%s rows=%s +%s (loaded=%s / remote=%s)",

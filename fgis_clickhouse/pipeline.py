@@ -12,30 +12,32 @@ import os
 from datetime import date, datetime, timedelta
 
 from .clickhouse_io import CH, ensure_tables
-from .dates import iter_days, parse_ymd
+from .dates import parse_ymd
 from .fgis_api import FGISClient
 from .mit_sync import sync_mit_registry
 from .runtime import (
+    DAILY_MONTH_DAYS,
+    DAILY_MONTH_EVERY,
     DEFAULT_START_DATE,
     DEFAULT_VRI_ROWS,
     DEFAULT_VRI_SLEEP,
-    FULL_RECONCILE_EVERY,
-    PROD_SYNC_DAYS,
+    HALFYEAR_2Y_DAYS,
+    HALFYEAR_2Y_EVERY,
+    MIT_SYNC_EVERY,
+    MONTHLY_YEAR_DAYS,
+    MONTHLY_YEAR_EVERY,
+    PROD_DEFAULT_DAYS,
     PROD_SYNC_HOUR,
-    SYNC_RECENT_DAYS,
-    TEST_SYNC_EVERY,
-    YEAR_RECONCILE_DAYS,
-    YEAR_RECONCILE_EVERY,
+    WEEKLY_3M_DAYS,
+    WEEKLY_3M_EVERY,
     acquire_process_lock,
     env_pick,
     should_run,
-    should_run_any,
     state_get,
     state_get_any,
     state_set,
 )
 from .vri_sync import (
-    reconcile_day_with_remote,
     reconcile_prod_by_year_month,
     reconcile_remote_by_year_month,
 )
@@ -53,12 +55,6 @@ def _should_run_daily_after(ch: CH, key: str, now: datetime, hour: int) -> bool:
         return False
     last = state_get(ch, key)
     return last is None or last.date() < now.date()
-
-def _remote_checked_after_last_prod(ch_test: CH, ch_prod: CH) -> bool:
-    """Return True when prod has not yet consumed the latest full test check."""
-    last_full = state_get_any(ch_test, ("test_full_reconcile", "simple_remote_full"))
-    last_prod = state_get_any(ch_prod, ("prod_full_sync", "simple_prod_full"))
-    return last_full is not None and (last_prod is None or last_full > last_prod)
 
 def sync_test_mit(ch: CH, client: FGISClient) -> bool:
     """Refresh MIT in test by inserting missing registry numbers and merging duplicates."""
@@ -78,35 +74,95 @@ def sync_test_mit(ch: CH, client: FGISClient) -> bool:
     log.info("TEST MIT: done (inserted=%s)", total)
     return True
 
-def sync_test_recent_vri(ch: CH, client: FGISClient, start_date: date, end_date: date) -> bool:
-    """Keep the hot VRI tail correct; recent FGIS data changes most often."""
-    start = _window_start(start_date, end_date, SYNC_RECENT_DAYS)
-    log.info("TEST VRI recent: %s -> %s", start, end_date)
-    ok = True
-    for day in iter_days(start, end_date):
-        ok = reconcile_day_with_remote(ch, client, day, DEFAULT_VRI_ROWS, DEFAULT_VRI_SLEEP) and ok
-    if ok:
-        state_set(ch, "test_recent_vri", datetime.now())
-    return ok
+def reconcile_test_vri_window(
+    ch: CH,
+    client: FGISClient,
+    start_date: date,
+    end_date: date,
+    *,
+    days: int,
+    label: str,
+    state_keys: tuple[str, ...],
+) -> bool:
+    """Reconcile one rolling VRI window and mark all windows it covers.
 
-def reconcile_test_year(ch: CH, client: FGISClient, start_date: date, end_date: date) -> bool:
-    """Weekly safety check for the last year of VRI data."""
-    start = _window_start(start_date, end_date, YEAR_RECONCILE_DAYS)
-    log.info("TEST VRI year check: %s -> %s", start, end_date)
+    The job does not blindly reload the whole window. It compares year/month/day
+    counts with FGIS and reloads only days where local rows differ from remote.
+    """
+    start = _window_start(start_date, end_date, days)
+    log.info("TEST VRI %s check: %s -> %s", label, start, end_date)
     ok = reconcile_remote_by_year_month(ch, client, start, end_date, DEFAULT_VRI_ROWS, DEFAULT_VRI_SLEEP)
     if ok:
-        state_set(ch, "test_year_reconcile", datetime.now())
+        now = datetime.now()
+        for key in state_keys:
+            state_set(ch, key, now)
     return ok
 
-def reconcile_test_full(ch: CH, client: FGISClient, start_date: date, end_date: date) -> bool:
-    """Monthly full-history VRI safety check against FGIS."""
-    log.info("TEST VRI full check: %s -> %s", start_date, end_date)
-    ok = reconcile_remote_by_year_month(ch, client, start_date, end_date, DEFAULT_VRI_ROWS, DEFAULT_VRI_SLEEP)
-    if ok:
-        now = datetime.now()
-        state_set(ch, "test_full_reconcile", now)
-        state_set(ch, "test_year_reconcile", now)
-    return ok
+def _due_test_vri_scope(ch: CH, now: datetime) -> tuple[str, int, tuple[str, ...]] | None:
+    """Pick the widest due test-vs-FGIS VRI window for this run."""
+    scopes = [
+        (
+            "month",
+            DAILY_MONTH_DAYS,
+            DAILY_MONTH_EVERY,
+            ("test_daily_month", "test_recent_vri"),
+            ("test_daily_month",),
+        ),
+        (
+            "3m",
+            WEEKLY_3M_DAYS,
+            WEEKLY_3M_EVERY,
+            ("test_weekly_3m", "test_year_reconcile"),
+            ("test_weekly_3m", "test_daily_month"),
+        ),
+        (
+            "year",
+            MONTHLY_YEAR_DAYS,
+            MONTHLY_YEAR_EVERY,
+            ("test_monthly_year", "test_year_reconcile", "test_full_reconcile", "simple_remote_full"),
+            ("test_monthly_year", "test_weekly_3m", "test_daily_month"),
+        ),
+        (
+            "2y",
+            HALFYEAR_2Y_DAYS,
+            HALFYEAR_2Y_EVERY,
+            ("test_halfyear_2y", "test_full_reconcile", "simple_remote_full"),
+            ("test_halfyear_2y", "test_monthly_year", "test_weekly_3m", "test_daily_month"),
+        ),
+    ]
+    states = [(scope, state_get_any(ch, scope[3])) for scope in scopes]
+
+    # On first deployment, initialize missing scopes from small to large across
+    # separate timer runs instead of immediately launching the two-year window.
+    for scope, last in states:
+        if last is None:
+            label, days, _every, _aliases, mark_keys = scope
+            return label, days, mark_keys
+
+    # Once all scopes have checkpoints, run the widest expired one. A wider
+    # successful check refreshes the smaller checkpoints too.
+    for scope, last in reversed(states):
+        label, days, every, _aliases, mark_keys = scope
+        if now - last >= every:
+            return label, days, mark_keys
+    return None
+
+def reconcile_due_test_vri(ch: CH, client: FGISClient, start_date: date, end_date: date) -> bool:
+    """Run the scheduled test-vs-FGIS VRI window that is due now."""
+    scope = _due_test_vri_scope(ch, datetime.now())
+    if not scope:
+        log.info("TEST VRI reconcile: skipped")
+        return True
+    label, days, state_keys = scope
+    return reconcile_test_vri_window(
+        ch,
+        client,
+        start_date,
+        end_date,
+        days=days,
+        label=label,
+        state_keys=state_keys,
+    )
 
 def replace_prod_mit_from_test(ch_test: CH, ch_prod: CH) -> bool:
     """Publish MIT by replacing prod from deduplicated test data."""
@@ -129,19 +185,50 @@ def replace_prod_mit_from_test(ch_test: CH, ch_prod: CH) -> bool:
         log.warning("PROD MIT: mismatch after replace (test=%s prod=%s)", source_rows, prod_rows)
     return ok
 
+def _latest_test_scope_for_prod(ch_test: CH, ch_prod: CH) -> tuple[str, int, tuple[str, ...]]:
+    """Choose how much prod must consume based on completed test windows."""
+    scopes = [
+        (
+            "2y",
+            HALFYEAR_2Y_DAYS,
+            ("test_halfyear_2y", "test_full_reconcile", "simple_remote_full"),
+            ("prod_2y_sync", "prod_full_sync", "simple_prod_full"),
+            ("prod_2y_sync", "prod_year_sync", "prod_3m_sync", "prod_month_sync"),
+        ),
+        (
+            "year",
+            MONTHLY_YEAR_DAYS,
+            ("test_monthly_year", "test_year_reconcile"),
+            ("prod_year_sync",),
+            ("prod_year_sync", "prod_3m_sync", "prod_month_sync"),
+        ),
+        (
+            "3m",
+            WEEKLY_3M_DAYS,
+            ("test_weekly_3m",),
+            ("prod_3m_sync",),
+            ("prod_3m_sync", "prod_month_sync"),
+        ),
+    ]
+    for label, days, test_keys, prod_keys, mark_keys in scopes:
+        last_test = state_get_any(ch_test, test_keys)
+        last_prod = state_get_any(ch_prod, prod_keys)
+        if last_test is not None and (last_prod is None or last_test > last_prod):
+            return label, days, mark_keys
+    return "month", PROD_DEFAULT_DAYS, ("prod_month_sync",)
+
 def sync_prod_from_test(ch_test: CH, ch_prod: CH, start_date: date, end_date: date) -> bool:
-    """Publish test to prod and choose full/year scope based on test checks."""
-    full = _remote_checked_after_last_prod(ch_test, ch_prod)
-    vri_start = start_date if full else _window_start(start_date, end_date, PROD_SYNC_DAYS)
-    scope = "full" if full else "year"
+    """Publish test to prod using the newest completed test-check scope."""
+    scope, days, prod_scope_keys = _latest_test_scope_for_prod(ch_test, ch_prod)
+    vri_start = _window_start(start_date, end_date, days)
     log.info("PROD sync: start (%s, %s -> %s)", scope, vri_start, end_date)
     mit_ok = replace_prod_mit_from_test(ch_test, ch_prod)
     vri_ok = reconcile_prod_by_year_month(ch_test, ch_prod, vri_start, end_date, dedup=True)
     if mit_ok and vri_ok:
         now = datetime.now()
         state_set(ch_prod, "prod_daily_sync", now)
-        if full:
-            state_set(ch_prod, "prod_full_sync", now)
+        for key in prod_scope_keys:
+            state_set(ch_prod, key, now)
     log.info("PROD sync: done (mit=%s vri=%s)", mit_ok, vri_ok)
     return mit_ok and vri_ok
 
@@ -170,38 +257,27 @@ def run_pipeline(ch_test: CH, ch_prod: CH, client: FGISClient, start_date: date,
     now = datetime.now()
     ok = True
 
-    # Fast path first: keep the user-facing test database fresh three times per
-    # day without scanning the full historical dataset.
-    if should_run(ch_test, "test_recent_vri", TEST_SYNC_EVERY, now):
+    # MIT is cheap compared to VRI and is refreshed daily before VRI windows.
+    if should_run(ch_test, "test_mit_sync", MIT_SYNC_EVERY, now):
         try:
             sync_test_mit(ch_test, client)
-            ok = sync_test_recent_vri(ch_test, client, start_date, end_date) and ok
         except Exception:
             ok = False
-            log.exception("TEST recent sync: failed")
+            log.exception("TEST MIT sync: failed")
     else:
-        log.info("TEST recent sync: skipped")
+        log.info("TEST MIT sync: skipped")
 
     # If this is the 21:00 run, publish before starting an expensive weekly or
     # monthly check. If a long check crosses 21:00, we try again at the end.
     ok, prod_done = maybe_sync_prod(ch_test, ch_prod, start_date, ok)
 
-    # Safety checks are intentionally range-first: healthy months/years finish
-    # with counts only; only mismatches degrade to day reloads.
-    if should_run_any(ch_test, ("test_full_reconcile", "simple_remote_full"), FULL_RECONCILE_EVERY, now):
-        try:
-            ok = reconcile_test_full(ch_test, client, start_date, end_date) and ok
-        except Exception:
-            ok = False
-            log.exception("TEST full check: failed")
-    elif should_run(ch_test, "test_year_reconcile", YEAR_RECONCILE_EVERY, now):
-        try:
-            ok = reconcile_test_year(ch_test, client, start_date, end_date) and ok
-        except Exception:
-            ok = False
-            log.exception("TEST year check: failed")
-    else:
-        log.info("TEST reconcile: skipped")
+    # VRI checks are range-first: healthy years/months finish with counts only;
+    # mismatching months degrade to day reloads through a staging table.
+    try:
+        ok = reconcile_due_test_vri(ch_test, client, start_date, end_date) and ok
+    except Exception:
+        ok = False
+        log.exception("TEST VRI reconcile: failed")
 
     if not prod_done:
         ok, _prod_done = maybe_sync_prod(ch_test, ch_prod, start_date, ok)

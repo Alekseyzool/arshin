@@ -25,15 +25,21 @@ DEFAULT_VRI_ROWS = 9999
 DEFAULT_VRI_SLEEP = 0.0
 DEFAULT_VRI_MIN_ROWS = 10
 
-# Operational schedule. systemd starts the script three times per day; these
-# gates make each run idempotent if a previous long run is still fresh.
-SYNC_RECENT_DAYS = 14
-TEST_SYNC_EVERY = timedelta(hours=8)
-YEAR_RECONCILE_DAYS = 365
-YEAR_RECONCILE_EVERY = timedelta(days=7)
-FULL_RECONCILE_EVERY = timedelta(days=30)
+# Operational schedule. systemd can start the script several times per day; the
+# gates below choose one VRI safety window per run. Wider windows cover smaller
+# ones, so a monthly year check also satisfies the daily month and weekly
+# quarter checks.
+MIT_SYNC_EVERY = timedelta(days=1)
+DAILY_MONTH_DAYS = 31
+DAILY_MONTH_EVERY = timedelta(days=1)
+WEEKLY_3M_DAYS = 93
+WEEKLY_3M_EVERY = timedelta(days=7)
+MONTHLY_YEAR_DAYS = 365
+MONTHLY_YEAR_EVERY = timedelta(days=30)
+HALFYEAR_2Y_DAYS = 730
+HALFYEAR_2Y_EVERY = timedelta(days=182)
 PROD_SYNC_HOUR = 21
-PROD_SYNC_DAYS = 365
+PROD_DEFAULT_DAYS = DAILY_MONTH_DAYS
 
 # FGIS cannot reliably use start-based fallback beyond this offset.
 MAX_VRI_START_FALLBACK = 9999

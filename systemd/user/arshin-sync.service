@@ -1,0 +1,14 @@
+[Unit]
+Description=FGIS Arshin ClickHouse sync
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/projects/arshin
+EnvironmentFile=%h/projects/arshin/.env
+Environment=PYTHONUNBUFFERED=1
+ExecStart=%h/projects/arshin/.venv/bin/python backend_sync.py
+TimeoutStartSec=infinity
+StandardOutput=append:%h/projects/arshin/run.log
+StandardError=append:%h/projects/arshin/run.log

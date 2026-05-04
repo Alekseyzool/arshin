@@ -1,0 +1,11 @@
+[Unit]
+Description=Run FGIS Arshin sync at 05:00, 13:00, and 21:00
+
+[Timer]
+OnCalendar=*-*-* 05,13,21:00:00
+Persistent=true
+RandomizedDelaySec=5m
+Unit=arshin-sync.service
+
+[Install]
+WantedBy=timers.target

@@ -118,6 +118,7 @@ def ensure_tables(ch: CH, db: Optional[str] = None) -> None:
             mit_title String,
             mpi String,
             notation String,
+            j_modification String,
             order_date Nullable(Date),
             order_num String,
             production_type UInt8,

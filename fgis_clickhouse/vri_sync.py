@@ -273,15 +273,31 @@ def reload_vri_day_from_remote(
                 table=stage_table,
             )
         stage_rows, stage_uniq = local_vri_stats_for_table(ch, stage_table, d)
-        if stage_rows != stage_uniq or stage_uniq != remote_rows:
+        expected_rows = remote_rows
+        try:
+            latest_remote_rows = remote_vri_count(client, fq_for_day(d))
+        except Exception as exc:
+            log.warning("REMOTE %s: post-load count failed: %s", d, exc)
+        else:
+            if latest_remote_rows != remote_rows:
+                log.info(
+                    "REMOTE %s: remote count changed during reload (%s -> %s)",
+                    d,
+                    remote_rows,
+                    latest_remote_rows,
+                )
+            expected_rows = latest_remote_rows
+        if stage_rows != stage_uniq or stage_uniq != expected_rows:
             log.warning(
-                "REMOTE %s: staging mismatch (rows=%s uniq=%s remote=%s)",
+                "REMOTE %s: staging mismatch (rows=%s uniq=%s remote=%s initial_remote=%s)",
                 d,
                 stage_rows,
                 stage_uniq,
+                expected_rows,
                 remote_rows,
             )
             return False
+        remote_rows = expected_rows
         delete_vri_day(ch, d)
         if remote_rows > 0:
             day_str = d.strftime("%Y-%m-%d")

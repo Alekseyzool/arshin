@@ -54,6 +54,39 @@ class _FakeCH:
         return date(2026, 4, 16)
 
 
+class _ReloadFakeCH:
+    db = "fgis_test"
+
+    def __init__(self) -> None:
+        self.main_rows: list[tuple[object, ...]] = [_doc("old")]
+        self.stage_rows: list[tuple[object, ...]] = []
+
+    def exec(self, sql: str, params: dict | None = None) -> None:
+        if "TRUNCATE TABLE" in sql and "verifications_reload_tmp" in sql:
+            self.stage_rows.clear()
+        elif "ALTER TABLE" in sql and "DELETE WHERE" in sql:
+            self.main_rows.clear()
+        elif "INSERT INTO fgis_test.verifications SELECT" in sql:
+            self.main_rows.extend(self.stage_rows)
+
+    def insert(self, table: str, columns: list[str], rows: list[tuple[object, ...]]) -> None:
+        if table == "verifications_reload_tmp":
+            self.stage_rows.extend(rows)
+        else:
+            self.main_rows.extend(rows)
+
+    def rows(self, sql: str):
+        if "verifications_reload_tmp" in sql:
+            ids = {row[-1] for row in self.stage_rows}
+            return [(len(self.stage_rows), len(ids))]
+        return []
+
+    def scalar(self, sql: str):
+        if "FROM fgis_test.verifications" in sql:
+            return len(self.main_rows)
+        return 0
+
+
 class CursorFallbackTests(unittest.TestCase):
     def test_resolve_vri_start_date_honors_explicit_start(self) -> None:
         explicit = date(2026, 4, 2)
@@ -154,3 +187,30 @@ class CursorFallbackTests(unittest.TestCase):
         next(pages)
         with self.assertRaisesRegex(RuntimeError, r"start fallback is unavailable beyond start=9999"):
             next(pages)
+
+    def test_reload_accepts_stage_when_remote_count_changes_during_load(self) -> None:
+        docs = [_doc("1"), _doc("2"), _doc("3")]
+
+        class FakeClient:
+            def __init__(self) -> None:
+                self.counts = iter([2, 3])
+
+            def vri_count(self, fq: str | None) -> int:
+                return next(self.counts)
+
+            def vri_cursor(self, *, fq: str | None, rows: int, cursor_mark: str, sort: str = "vri_id asc"):
+                return docs, 2, cursor_mark
+
+        ch = _ReloadFakeCH()
+
+        ok = backend_sync.reload_vri_day_from_remote(
+            ch,
+            FakeClient(),
+            date(2026, 4, 3),
+            rows=9999,
+            sleep_s=0.0,
+        )
+
+        self.assertTrue(ok)
+        self.assertEqual([row[-1] for row in ch.main_rows], ["1", "2", "3"])
+        self.assertEqual(ch.stage_rows, [])

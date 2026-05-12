@@ -91,6 +91,7 @@ from fgis_clickhouse.vri_sync import (
     replace_vri_day_from_test,
     resolve_vri_start_date,
     sync_vri_day,
+    top_up_vri_day_from_remote,
 )
 
 

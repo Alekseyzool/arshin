@@ -58,13 +58,15 @@ class _ReloadFakeCH:
     db = "fgis_test"
 
     def __init__(self) -> None:
-        self.main_rows: list[tuple[object, ...]] = [_doc("old")]
+        self.main_rows: list[tuple[object, ...]] = [("old",)]
         self.stage_rows: list[tuple[object, ...]] = []
+        self.delete_calls = 0
 
     def exec(self, sql: str, params: dict | None = None) -> None:
         if "TRUNCATE TABLE" in sql and "verifications_reload_tmp" in sql:
             self.stage_rows.clear()
         elif "ALTER TABLE" in sql and "DELETE WHERE" in sql:
+            self.delete_calls += 1
             self.main_rows.clear()
         elif "INSERT INTO fgis_test.verifications SELECT" in sql:
             self.main_rows.extend(self.stage_rows)
@@ -85,6 +87,11 @@ class _ReloadFakeCH:
         if "FROM fgis_test.verifications" in sql:
             return len(self.main_rows)
         return 0
+
+    def existing_ids_for_date(self, table: str, idcol: str, ids, *, date_col: str, day: date) -> set[str]:
+        rows = self.stage_rows if table == "verifications_reload_tmp" else self.main_rows
+        requested = {value for value in ids if value}
+        return {row[-1] for row in rows if row[-1] in requested}
 
 
 class CursorFallbackTests(unittest.TestCase):
@@ -213,4 +220,30 @@ class CursorFallbackTests(unittest.TestCase):
 
         self.assertTrue(ok)
         self.assertEqual([row[-1] for row in ch.main_rows], ["1", "2", "3"])
+        self.assertEqual(ch.stage_rows, [])
+
+    def test_reconcile_top_up_missing_rows_without_reloading_day(self) -> None:
+        docs = [_doc("1"), _doc("2"), _doc("3")]
+
+        class FakeClient:
+            def vri_count(self, fq: str | None) -> int:
+                return 3
+
+            def vri_cursor(self, *, fq: str | None, rows: int, cursor_mark: str, sort: str = "vri_id asc"):
+                return docs, 3, cursor_mark
+
+        ch = _ReloadFakeCH()
+        ch.main_rows = [("1",), ("2",)]
+
+        ok = backend_sync.reconcile_day_with_remote(
+            ch,
+            FakeClient(),
+            date(2026, 4, 3),
+            rows=9999,
+            sleep_s=0.0,
+        )
+
+        self.assertTrue(ok)
+        self.assertEqual([row[-1] for row in ch.main_rows], ["1", "2", "3"])
+        self.assertEqual(ch.delete_calls, 0)
         self.assertEqual(ch.stage_rows, [])

@@ -325,6 +325,66 @@ def reload_vri_day_from_remote(
     )
     return False
 
+def top_up_vri_day_from_remote(
+    ch: CH,
+    client: FGISClient,
+    d: date,
+    rows: int,
+    sleep_s: float,
+    remote_rows: Optional[int] = None,
+) -> bool:
+    """Insert missing VRI rows for a day without replacing the existing day."""
+    initial_remote_rows = remote_rows
+    if initial_remote_rows is None:
+        initial_remote_rows = remote_vri_count(client, fq_for_day(d))
+    inserted = sync_vri_day(
+        ch,
+        client,
+        d,
+        rows,
+        sleep_s,
+        skip_existing=True,
+        remote_total=initial_remote_rows,
+        table="verifications",
+    )
+    local_rows, local_uniq = local_vri_stats(ch, d)
+    expected_rows = initial_remote_rows
+    try:
+        latest_remote_rows = remote_vri_count(client, fq_for_day(d))
+    except Exception as exc:
+        log.warning("REMOTE %s: post-top-up count failed: %s", d, exc)
+    else:
+        if latest_remote_rows != initial_remote_rows:
+            log.info(
+                "REMOTE %s: remote count changed during top-up (%s -> %s)",
+                d,
+                initial_remote_rows,
+                latest_remote_rows,
+            )
+        expected_rows = latest_remote_rows
+    if local_rows == local_uniq == expected_rows:
+        log.info("REMOTE %s: OK (rows=%s uniq=%s remote=%s)", d, local_rows, local_uniq, expected_rows)
+        return True
+    if local_rows != local_uniq or local_rows > expected_rows:
+        log.warning(
+            "REMOTE %s: top-up produced reload state (rows=%s uniq=%s remote=%s inserted=%s)",
+            d,
+            local_rows,
+            local_uniq,
+            expected_rows,
+            inserted,
+        )
+        return reload_vri_day_from_remote(ch, client, d, rows, sleep_s)
+    log.warning(
+        "REMOTE %s: top-up incomplete (rows=%s uniq=%s remote=%s inserted=%s)",
+        d,
+        local_rows,
+        local_uniq,
+        expected_rows,
+        inserted,
+    )
+    return False
+
 def reconcile_day_with_remote(
     ch: CH,
     client: FGISClient,
@@ -337,6 +397,15 @@ def reconcile_day_with_remote(
     if local_rows == local_uniq == remote_rows:
         log.info("REMOTE %s: OK (rows=%s uniq=%s remote=%s)", d, local_rows, local_uniq, remote_rows)
         return True
+    if local_rows == local_uniq and local_rows < remote_rows:
+        log.warning(
+            "REMOTE %s: top-up (rows=%s uniq=%s remote=%s)",
+            d,
+            local_rows,
+            local_uniq,
+            remote_rows,
+        )
+        return top_up_vri_day_from_remote(ch, client, d, rows, sleep_s, remote_rows=remote_rows)
     log.warning(
         "REMOTE %s: reload (rows=%s uniq=%s remote=%s)",
         d,

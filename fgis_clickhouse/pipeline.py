@@ -233,6 +233,27 @@ def sync_prod_from_test(ch_test: CH, ch_prod: CH, start_date: date, end_date: da
     log.info("PROD sync: done (mit=%s vri=%s)", mit_ok, vri_ok)
     return mit_ok and vri_ok
 
+def run_manual_vri_reconcile(
+    ch_test: CH,
+    ch_prod: CH,
+    client: FGISClient,
+    start: date,
+    end: date,
+) -> bool:
+    """Repair an explicit VRI range in test from FGIS, then publish it to prod."""
+    log.info("MANUAL VRI reconcile: %s -> %s", start, end)
+    test_ok = reconcile_remote_by_year_month(ch_test, client, start, end, DEFAULT_VRI_ROWS, DEFAULT_VRI_SLEEP)
+    if not test_ok:
+        log.warning("MANUAL VRI reconcile: prod skipped because test reconcile failed")
+        return False
+    prod_ok = reconcile_prod_by_year_month(ch_test, ch_prod, start, end, dedup=True)
+    now = datetime.now()
+    state_set(ch_test, "manual_vri_reconcile", now)
+    if prod_ok:
+        state_set(ch_prod, "manual_vri_sync", now)
+    log.info("MANUAL VRI reconcile: done (test=%s prod=%s)", test_ok, prod_ok)
+    return prod_ok
+
 def maybe_sync_prod(ch_test: CH, ch_prod: CH, start_date: date, upstream_ok: bool) -> tuple[bool, bool]:
     """Run the daily prod publish when the local time window is open."""
     prod_now = datetime.now()
@@ -315,6 +336,8 @@ def main() -> None:
     if start_date is None:
         start_date = DEFAULT_START_DATE
     end_date = date.today()
+    manual_vri_start_env = env_pick("VRI_RECONCILE_START", "MANUAL_VRI_START", default="").strip()
+    manual_vri_end_env = env_pick("VRI_RECONCILE_END", "MANUAL_VRI_END", default="").strip()
 
     ch_admin = CH(host, port, user, password, "default")
     ensure_tables(ch_admin, db_test)
@@ -324,4 +347,15 @@ def main() -> None:
 
     client = FGISClient(proxy=proxy, rps=rps)
     log.info("Pipeline: start_date=%s end_date=%s rps=%s", start_date, end_date, rps)
+    if manual_vri_start_env:
+        manual_start = parse_ymd(manual_vri_start_env)
+        manual_end = parse_ymd(manual_vri_end_env) if manual_vri_end_env else end_date
+        if manual_start is None:
+            raise ValueError(f"Invalid VRI_RECONCILE_START={manual_vri_start_env!r}")
+        if manual_end is None:
+            raise ValueError(f"Invalid VRI_RECONCILE_END={manual_vri_end_env!r}")
+        if manual_end < manual_start:
+            raise ValueError(f"VRI_RECONCILE_END {manual_end} is before VRI_RECONCILE_START {manual_start}")
+        run_manual_vri_reconcile(ch_test, ch_prod, client, manual_start, manual_end)
+        return
     run_pipeline(ch_test, ch_prod, client, start_date, end_date)

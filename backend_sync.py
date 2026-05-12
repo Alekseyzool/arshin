@@ -42,6 +42,7 @@ from fgis_clickhouse.pipeline import (
     reconcile_due_test_vri,
     reconcile_test_vri_window,
     replace_prod_mit_from_test,
+    run_manual_vri_reconcile,
     run_pipeline,
     sync_prod_from_test,
     sync_test_mit,

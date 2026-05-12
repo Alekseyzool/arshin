@@ -147,14 +147,14 @@ def _due_test_vri_scope(ch: CH, now: datetime) -> tuple[str, int, tuple[str, ...
             return label, days, mark_keys
     return None
 
-def reconcile_due_test_vri(ch: CH, client: FGISClient, start_date: date, end_date: date) -> bool:
+def reconcile_due_test_vri(ch: CH, client: FGISClient, start_date: date, end_date: date) -> tuple[bool, bool]:
     """Run the scheduled test-vs-FGIS VRI window that is due now."""
     scope = _due_test_vri_scope(ch, datetime.now())
     if not scope:
         log.info("TEST VRI reconcile: skipped")
-        return True
+        return True, False
     label, days, state_keys = scope
-    return reconcile_test_vri_window(
+    ok = reconcile_test_vri_window(
         ch,
         client,
         start_date,
@@ -163,6 +163,7 @@ def reconcile_due_test_vri(ch: CH, client: FGISClient, start_date: date, end_dat
         label=label,
         state_keys=state_keys,
     )
+    return ok, True
 
 def replace_prod_mit_from_test(ch_test: CH, ch_prod: CH) -> bool:
     """Publish MIT by replacing prod from deduplicated test data."""
@@ -268,17 +269,27 @@ def run_pipeline(ch_test: CH, ch_prod: CH, client: FGISClient, start_date: date,
         log.info("TEST MIT sync: skipped")
 
     # If this is the 21:00 run, publish before starting an expensive weekly or
-    # monthly check. If a long check crosses 21:00, we try again at the end.
+    # monthly check. If a long check crosses 21:00, or a test window finishes
+    # during this run, we try again at the end.
     ok, prod_done = maybe_sync_prod(ch_test, ch_prod, start_date, ok)
 
     # VRI checks are range-first: healthy years/months finish with counts only;
     # mismatching months degrade to day reloads through a staging table.
+    test_vri_ran = False
     try:
-        ok = reconcile_due_test_vri(ch_test, client, start_date, end_date) and ok
+        test_vri_ok, test_vri_ran = reconcile_due_test_vri(ch_test, client, start_date, end_date)
+        ok = test_vri_ok and ok
     except Exception:
         ok = False
         log.exception("TEST VRI reconcile: failed")
 
+    if test_vri_ran and ok:
+        try:
+            ok = sync_prod_from_test(ch_test, ch_prod, start_date, end_date) and ok
+            prod_done = True
+        except Exception:
+            ok = False
+            log.exception("PROD sync after TEST VRI reconcile: failed")
     if not prod_done:
         ok, _prod_done = maybe_sync_prod(ch_test, ch_prod, start_date, ok)
 

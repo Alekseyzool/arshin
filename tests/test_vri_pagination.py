@@ -4,6 +4,7 @@ import sys
 import types
 import unittest
 from datetime import date
+from unittest.mock import patch
 from urllib.parse import quote
 
 
@@ -247,3 +248,37 @@ class CursorFallbackTests(unittest.TestCase):
         self.assertEqual([row[-1] for row in ch.main_rows], ["1", "2", "3"])
         self.assertEqual(ch.delete_calls, 0)
         self.assertEqual(ch.stage_rows, [])
+
+    def test_prod_day_reloads_when_counts_match_but_digest_differs(self) -> None:
+        class FakeCH:
+            def __init__(self, db: str) -> None:
+                self.db = db
+
+        ch_test = FakeCH("fgis_test")
+        ch_prod = FakeCH("fgis_prod")
+
+        with (
+            patch(
+                "fgis_clickhouse.vri_sync.local_vri_stats",
+                side_effect=[(10, 10), (10, 10), (10, 10)],
+            ),
+            patch(
+                "fgis_clickhouse.vri_sync.local_vri_digest_range",
+                side_effect=[
+                    (10, 100, 200),
+                    (10, 300, 400),
+                    (10, 100, 200),
+                    (10, 100, 200),
+                ],
+            ),
+            patch("fgis_clickhouse.vri_sync.replace_vri_day_from_test") as replace_day,
+        ):
+            ok = backend_sync.reconcile_day_with_test(
+                ch_test,
+                ch_prod,
+                date(2025, 9, 17),
+                dedup=True,
+            )
+
+        self.assertTrue(ok)
+        replace_day.assert_called_once_with(ch_test, ch_prod, date(2025, 9, 17), dedup=True)

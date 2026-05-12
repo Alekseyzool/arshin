@@ -99,6 +99,37 @@ def local_vri_counts_range(ch: CH, start: date, end: date) -> tuple[int, int]:
     except Exception:
         return 0, 0
 
+def local_vri_digest_range(ch: CH, start: date, end: date) -> tuple[int, int, int]:
+    """Return count plus stable VRI fingerprints for a deduplicated range."""
+    start_s = start.strftime("%Y-%m-%d")
+    end_s = end.strftime("%Y-%m-%d")
+    where = f"verification_date >= toDate('{start_s}') AND verification_date <= toDate('{end_s}')"
+    rows = ch.rows(
+        f"""
+        SELECT
+            count(),
+            sum(sipHash64(vri_id)),
+            groupBitXor(sipHash64(
+                vri_id,
+                toString(verification_date),
+                applicability,
+                mi_modification,
+                mi_number,
+                mit_notation,
+                mit_number,
+                mit_title,
+                org_title,
+                ifNull(toString(valid_date), '')
+            ))
+        FROM {ch.db}.verifications FINAL
+        WHERE {where}
+        """
+    )
+    if not rows:
+        return 0, 0, 0
+    row = rows[0]
+    return int(row[0] or 0), int(row[1] or 0), int(row[2] or 0)
+
 def remote_vri_count(client: FGISClient, fq: str) -> int:
     if hasattr(client, "vri_count"):
         try:
@@ -488,7 +519,12 @@ def replace_vri_day_from_test(ch_src: CH, ch_dst: CH, d: date, *, dedup: bool) -
 def reconcile_day_with_test(ch_test: CH, ch_prod: CH, d: date, *, dedup: bool) -> bool:
     test_rows, test_uniq = local_vri_stats(ch_test, d)
     prod_rows, prod_uniq = local_vri_stats(ch_prod, d)
+    digests_match = False
     if test_rows == test_uniq and prod_rows == prod_uniq and test_uniq == prod_uniq:
+        test_digest = local_vri_digest_range(ch_test, d, d)
+        prod_digest = local_vri_digest_range(ch_prod, d, d)
+        digests_match = test_digest == prod_digest
+    if test_rows == test_uniq and prod_rows == prod_uniq and test_uniq == prod_uniq and digests_match:
         log.info(
             "PROD %s: OK (test=%s prod=%s)",
             d,
@@ -497,29 +533,46 @@ def reconcile_day_with_test(ch_test: CH, ch_prod: CH, d: date, *, dedup: bool) -
         )
         return True
     log.warning(
-        "PROD %s: reload (test_rows=%s test_uniq=%s prod_rows=%s prod_uniq=%s)",
+        "PROD %s: reload (test_rows=%s test_uniq=%s prod_rows=%s prod_uniq=%s digest_match=%s)",
         d,
         test_rows,
         test_uniq,
         prod_rows,
         prod_uniq,
+        digests_match,
     )
     if test_uniq == 0:
         delete_vri_day(ch_prod, d)
     else:
         replace_vri_day_from_test(ch_test, ch_prod, d, dedup=dedup)
     prod_rows, prod_uniq = local_vri_stats(ch_prod, d)
-    if prod_rows == prod_uniq == test_uniq:
+    test_digest = local_vri_digest_range(ch_test, d, d)
+    prod_digest = local_vri_digest_range(ch_prod, d, d)
+    if prod_rows == prod_uniq == test_uniq and prod_digest == test_digest:
         log.info("PROD %s: OK after reload (rows=%s uniq=%s)", d, prod_rows, prod_uniq)
         return True
     log.warning(
-        "PROD %s: mismatch after reload (rows=%s uniq=%s test=%s)",
+        "PROD %s: mismatch after reload (rows=%s uniq=%s test=%s digest_match=%s)",
         d,
         prod_rows,
         prod_uniq,
         test_uniq,
+        prod_digest == test_digest,
     )
     return False
+
+def _prod_range_ok(ch_test: CH, ch_prod: CH, start: date, end: date) -> tuple[bool, tuple[int, int], tuple[int, int]]:
+    test_rows, test_uniq = local_vri_counts_range(ch_test, start, end)
+    prod_rows, prod_uniq = local_vri_counts_range(ch_prod, start, end)
+    if not (
+        test_rows == test_uniq
+        and prod_rows == prod_uniq
+        and test_uniq == prod_uniq
+    ):
+        return False, (test_rows, test_uniq), (prod_rows, prod_uniq)
+    test_digest = local_vri_digest_range(ch_test, start, end)
+    prod_digest = local_vri_digest_range(ch_prod, start, end)
+    return test_digest == prod_digest, (test_rows, test_uniq), (prod_rows, prod_uniq)
 
 def reconcile_prod_by_year_month(
     ch_test: CH,
@@ -536,13 +589,13 @@ def reconcile_prod_by_year_month(
     """
     ok = True
     for year_start, year_end in iter_year_ranges(start, end):
-        test_rows, test_uniq = local_vri_counts_range(ch_test, year_start, year_end)
-        prod_rows, prod_uniq = local_vri_counts_range(ch_prod, year_start, year_end)
-        if (
-            test_rows == test_uniq
-            and prod_rows == prod_uniq
-            and test_uniq == prod_uniq
-        ):
+        range_ok, (test_rows, test_uniq), (prod_rows, prod_uniq) = _prod_range_ok(
+            ch_test,
+            ch_prod,
+            year_start,
+            year_end,
+        )
+        if range_ok:
             log.info(
                 "PROD YEAR %s: OK (test=%s prod=%s)",
                 year_start.year,
@@ -559,14 +612,14 @@ def reconcile_prod_by_year_month(
             prod_uniq,
         )
         for month_start, month_end in iter_month_ranges(year_start, year_end):
-            test_rows, test_uniq = local_vri_counts_range(ch_test, month_start, month_end)
-            prod_rows, prod_uniq = local_vri_counts_range(ch_prod, month_start, month_end)
+            range_ok, (test_rows, test_uniq), (prod_rows, prod_uniq) = _prod_range_ok(
+                ch_test,
+                ch_prod,
+                month_start,
+                month_end,
+            )
             label = month_start.strftime("%Y-%m")
-            if (
-                test_rows == test_uniq
-                and prod_rows == prod_uniq
-                and test_uniq == prod_uniq
-            ):
+            if range_ok:
                 log.info(
                     "PROD MONTH %s: OK (test=%s prod=%s)",
                     label,

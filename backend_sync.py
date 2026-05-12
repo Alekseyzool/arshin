@@ -80,6 +80,7 @@ from fgis_clickhouse.vri_sync import (
     insert_verifications,
     iter_vri_pages,
     local_vri_counts_range,
+    local_vri_digest_range,
     local_vri_stats,
     pick_start_date,
     reconcile_day_with_remote,
